@@ -46,6 +46,8 @@ _SUPPORTED_DTYPES: dict[torch.dtype, str] = {
     torch.float16: "f16",
     torch.bfloat16: "bf16",
 }
+_COMPILE_BACKEND_NAME = flyc.compile_backend_name()
+_ROCM_ARCH_BY_DEVICE: dict[int, str] = {}
 
 
 def _dtype_str(dtype: torch.dtype) -> str:
@@ -61,6 +63,24 @@ def _canonical_normalized_shape(normalized_shape) -> tuple[int, ...]:
     if isinstance(normalized_shape, (tuple, list)):
         return tuple(int(x) for x in normalized_shape)
     return (int(normalized_shape),)
+
+
+def _normalized_shape_1d(normalized_shape) -> int | None:
+    if isinstance(normalized_shape, int):
+        return normalized_shape
+    if isinstance(normalized_shape, (tuple, list, torch.Size)):
+        if len(normalized_shape) != 1:
+            return None
+        return int(normalized_shape[0])
+    return int(normalized_shape)
+
+
+def _compile_key_arch(device_index: int) -> str:
+    arch = _ROCM_ARCH_BY_DEVICE.get(device_index)
+    if arch is None:
+        arch = str(get_rocm_arch())
+        _ROCM_ARCH_BY_DEVICE[device_index] = arch
+    return arch
 
 
 def build_rmsnorm_module(
@@ -534,21 +554,20 @@ def rmsnorm_fwd(
     eps: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run FlyDSL forward and return the ATen output/rstd pair."""
-
-    shape = _canonical_normalized_shape(normalized_shape)
-    if len(shape) != 1:
+    n = _normalized_shape_1d(normalized_shape)
+    if n is None:
         raise ValueError("FlyDSL RMSNorm currently requires one normalized dimension")
 
-    n = shape[0]
     rows_m = input.numel() // n
     input_shape = input.shape
-    output = torch.empty_like(input)
 
     with torch.cuda.device(input.device):
-        input_2d = input.reshape(rows_m, n)
-        output_2d = output.reshape(rows_m, n)
+        is_2d = input.ndim == 2
+        input_2d = input if is_2d else input.reshape(rows_m, n)
+        output_2d = torch.empty_like(input_2d)
         rstd_flat = torch.empty(rows_m, device=input.device, dtype=torch.float32)
-        stream = torch.cuda.current_stream(input.device)
+
+        stream = torch.cuda.current_stream()
         device_index = input.device.index
         if device_index is None:
             device_index = torch.cuda.current_device()
@@ -557,8 +576,8 @@ def rmsnorm_fwd(
             n,
             _dtype_str(input.dtype),
             float(eps),
-            str(get_rocm_arch()),
-            flyc.compile_backend_name(),
+            _compile_key_arch(device_index),
+            _COMPILE_BACKEND_NAME,
             device_index,
             compile_args=(
                 input_2d,
@@ -569,10 +588,15 @@ def rmsnorm_fwd(
                 stream,
             ),
         )
+
         compiled(input_2d, weight, output_2d, rstd_flat, rows_m, stream)
 
-    stat_shape = list(input_shape[:-1]) + [1]
-    return output, rstd_flat.view(stat_shape)
+    if is_2d:
+        result = output_2d, rstd_flat.view((rows_m, 1))
+    else:
+        stat_shape = (*input_shape[:-1], 1)
+        result = output_2d.view(input_shape), rstd_flat.view(stat_shape)
+    return result
 
 
 def rmsnorm_bwd(
@@ -584,24 +608,24 @@ def rmsnorm_bwd(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run FlyDSL backward and return grad_input and grad_weight."""
 
-    shape = _canonical_normalized_shape(normalized_shape)
-    if len(shape) != 1:
+    n = _normalized_shape_1d(normalized_shape)
+    if n is None:
         raise ValueError("FlyDSL RMSNorm currently requires one normalized dimension")
 
-    n = shape[0]
     rows_m = input.numel() // n
 
     with torch.cuda.device(input.device):
-        input_2d = input.reshape(rows_m, n)
-        grad_2d = grad_out.reshape(rows_m, n)
-        rstd_flat = rstd.reshape(rows_m).contiguous()
+        is_2d = input.ndim == 2
+        input_2d = input if is_2d else input.reshape(rows_m, n)
+        grad_2d = grad_out if is_2d else grad_out.reshape(rows_m, n)
+        rstd_flat = rstd.reshape(rows_m)
         grad_input_2d = torch.empty_like(input_2d)
 
         # The kernel atomically accumulates dweight in fp32. flyc.compile may
         # execute the kernel once while tracing, so this buffer is deliberately
         # cleared after compilation and immediately before the measured launch.
         grad_weight_fp32 = torch.zeros(n, device=input.device, dtype=torch.float32)
-        stream = torch.cuda.current_stream(input.device)
+        stream = torch.cuda.current_stream()
         device_index = input.device.index
         if device_index is None:
             device_index = torch.cuda.current_device()
@@ -609,8 +633,8 @@ def rmsnorm_bwd(
         compiled = _compile_rmsnorm_bwd(
             n,
             _dtype_str(input.dtype),
-            str(get_rocm_arch()),
-            flyc.compile_backend_name(),
+            _compile_key_arch(device_index),
+            _COMPILE_BACKEND_NAME,
             device_index,
             compile_args=(
                 input_2d,
@@ -635,8 +659,8 @@ def rmsnorm_bwd(
             stream,
         )
 
-    grad_input = grad_input_2d.reshape(input.shape)
-    grad_weight = grad_weight_fp32.to(weight.dtype).reshape(weight.shape)
+    grad_input = grad_input_2d if is_2d else grad_input_2d.reshape(input.shape)
+    grad_weight = grad_weight_fp32.to(weight.dtype)
     return grad_input, grad_weight
 
 
