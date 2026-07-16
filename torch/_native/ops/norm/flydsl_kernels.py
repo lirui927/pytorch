@@ -33,7 +33,7 @@ from .flydsl_rmsnorm_common import BLOCK_THREADS, EPS, VEC_WIDTH, WARP_SIZE
 from .flydsl_rmsnorm_common import load_scalar as _load_scalar
 from .flydsl_rmsnorm_common import load_vec as _load_vec
 from .flydsl_rmsnorm_common import (
-    make_reduction_storage as _make_reduction_storage,
+    make_single_reduction_storage as _make_single_reduction_storage,
 )
 from .flydsl_rmsnorm_common import store_scalar as _store_scalar
 from .flydsl_rmsnorm_common import store_vec as _store_vec
@@ -83,6 +83,14 @@ def _compile_key_arch(device_index: int) -> str:
     return arch
 
 
+def _forward_block_threads(n: int) -> int:
+    if n >= 24576:
+        return 1024
+    if n >= 12288:
+        return 512
+    return BLOCK_THREADS
+
+
 def build_rmsnorm_module(
     N: int,
     dtype_str: str,
@@ -95,13 +103,14 @@ def build_rmsnorm_module(
     arch = get_rocm_arch()
     USE_HW_CVT_PK_BF16_F32 = (arch == "gfx950") or str(arch).startswith("gfx95")
 
-    tile_cols = BLOCK_THREADS * VEC_WIDTH
-    RED_SLOTS = max(1, (BLOCK_THREADS + WARP_SIZE - 1) // WARP_SIZE)
+    block_threads = _forward_block_threads(N)
+    tile_cols = block_threads * VEC_WIDTH
+    RED_SLOTS = max(1, (block_threads + WARP_SIZE - 1) // WARP_SIZE)
     elem_bits = 32 if dtype_str == "f32" else 16
 
-    SharedStorage = _make_reduction_storage(RED_SLOTS)
+    SharedStorage = _make_single_reduction_storage(RED_SLOTS)
 
-    @flyc.kernel
+    @flyc.kernel(known_block_size=[block_threads, 1, 1])
     def rmsnorm_kernel(
         Input: fx.Tensor,
         Gamma: fx.Tensor,
@@ -118,7 +127,6 @@ def build_rmsnorm_module(
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         s_red = lds.s_red.view(fx.make_layout(RED_SLOTS, 1))
-        s_red2 = lds.s_red2.view(fx.make_layout(RED_SLOTS, 1))
 
         if const_expr(store_rstd):
             Rstd_buf = fx.rocdl.make_buffer_tensor(Rstd)
@@ -134,41 +142,30 @@ def build_rmsnorm_module(
             return w
 
         def block_reduce_add(val):
-            dummy = fx.Float32(0.0)
-            r0, _ = block_reduce_add2(val, dummy)
-            return r0
-
-        def block_reduce_add2(val0, val1):
             if const_expr(RED_SLOTS == 1):
-                return wave_reduce_add(val0), wave_reduce_add(val1)
+                return wave_reduce_add(val)
 
             lane = tid % WARP_SIZE
             wave = tid // WARP_SIZE
 
-            w0 = wave_reduce_add(val0)
-            w1 = wave_reduce_add(val1)
+            w = wave_reduce_add(val)
 
             if lane == 0:
-                fx.memref_store(w0, s_red, wave)
-                fx.memref_store(w1, s_red2, wave)
+                fx.memref_store(w, s_red, wave)
             gpu.barrier()
 
             if wave == 0:
                 in_range = lane < RED_SLOTS
                 lane_safe = in_range.select(lane, 0)
-                v0 = fx.memref_load(s_red, lane_safe)
-                v1 = fx.memref_load(s_red2, lane_safe)
-                ww0 = in_range.select(v0, 0.0)
-                ww1 = in_range.select(v1, 0.0)
-                ww0 = wave_reduce_add(ww0)
-                ww1 = wave_reduce_add(ww1)
+                v = fx.memref_load(s_red, lane_safe)
+                ww = in_range.select(v, 0.0)
+                ww = wave_reduce_add(ww)
 
                 if lane == 0:
-                    fx.memref_store(ww0, s_red, 0)
-                    fx.memref_store(ww1, s_red2, 0)
+                    fx.memref_store(ww, s_red, 0)
             gpu.barrier()
 
-            return fx.memref_load(s_red, 0), fx.memref_load(s_red2, 0)
+            return fx.memref_load(s_red, 0)
 
         # ==================================================================
         # Fast path: N is a multiple of tile_cols
@@ -191,12 +188,11 @@ def build_rmsnorm_module(
 
             c_zero_f = fx.Float32(0.0)
             thread_sumsq = c_zero_f
-            thread_dummy = c_zero_f
             in_local = []
 
             # Pass 1: load + cache + sumsq
             for tile_i in range_constexpr(num_tiles):
-                idx = tid + tile_i * BLOCK_THREADS
+                idx = tid + tile_i * block_threads
                 vec = _load_vec(copy_atom, VEC_WIDTH, elem_dtype, in_div, idx)
                 in_local.append(vec)
                 x = vec.to(fx.Float32)
@@ -205,7 +201,7 @@ def build_rmsnorm_module(
                 red2 = x2.reduce(ReductionOp.ADD, fastmath=fm_fast)
                 thread_sumsq = thread_sumsq + red2
 
-            _, sum_sq = block_reduce_add2(thread_dummy, thread_sumsq)
+            sum_sq = block_reduce_add(thread_sumsq)
             mean_sq = sum_sq / n_float
             ms_eps = mean_sq + eps_c
             rrms = fmath.rsqrt(ms_eps, fastmath=fm_fast)
@@ -223,7 +219,7 @@ def build_rmsnorm_module(
 
             # Pass 2: normalize + gamma + store (reuse cached input)
             for tile_i in range_constexpr(num_tiles):
-                idx = tid + tile_i * BLOCK_THREADS
+                idx = tid + tile_i * block_threads
 
                 g = _load_vec(
                     copy_atom, VEC_WIDTH, elem_dtype, gamma_div, idx
@@ -233,7 +229,7 @@ def build_rmsnorm_module(
                 y = (x * rrms) * g
                 out_e = _to_elem_vec(dtype_str, elem_dtype, USE_HW_CVT_PK_BF16_F32, y)
 
-                out_idx = tid + tile_i * BLOCK_THREADS
+                out_idx = tid + tile_i * block_threads
                 _store_vec(copy_atom, VEC_WIDTH, elem_dtype, out_e, out_div, out_idx)
 
         else:
@@ -261,7 +257,7 @@ def build_rmsnorm_module(
             c_zero_f = fx.Float32(0.0)
             thread_sumsq = c_zero_f
 
-            for base_idx_int in range_constexpr(0, N, BLOCK_THREADS):
+            for base_idx_int in range_constexpr(0, N, block_threads):
                 idx = tid + base_idx_int
                 is_valid = idx < N
                 idx_safe = is_valid.select(idx, 0)
@@ -287,7 +283,7 @@ def build_rmsnorm_module(
                         rrms,
                     )
 
-            for base_idx_int in range_constexpr(0, N, BLOCK_THREADS):
+            for base_idx_int in range_constexpr(0, N, block_threads):
                 idx = tid + base_idx_int
                 if idx < N:
                     x_e = _load_scalar(copy_atom_s, elem_dtype, row_div, idx)
@@ -315,7 +311,7 @@ def build_rmsnorm_module(
             launcher = rmsnorm_kernel(Input, Gamma, Rstd, Output)
             launcher.launch(
                 grid=(m_in, 1, 1),
-                block=(BLOCK_THREADS, 1, 1),
+                block=(block_threads, 1, 1),
                 stream=stream,
             )
 
@@ -334,7 +330,7 @@ def build_rmsnorm_module(
         launcher = rmsnorm_kernel(Input, Gamma, Gamma, Output)
         launcher.launch(
             grid=(m_in, 1, 1),
-            block=(BLOCK_THREADS, 1, 1),
+            block=(block_threads, 1, 1),
             stream=stream,
         )
 
