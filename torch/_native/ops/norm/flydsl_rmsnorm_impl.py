@@ -8,10 +8,6 @@ import torch
 
 from ... import flydsl_utils as fu
 
-
-_SUPPORTED_HIDDEN_SIZES = frozenset(
-    {128, 256, 512, 1024, 2000, 2048, 4096, 8192}
-)
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _SUPPORTED_EPS = 1e-5
 _HIP_AVAILABLE = torch.version.hip is not None
@@ -51,8 +47,6 @@ def _common_supported(
     weight: torch.Tensor | None,
 ) -> bool:
     """Cheap dispatcher predicate shared by forward and backward."""
-    # if n not in _SUPPORTED_HIDDEN_SIZES:
-    #     return False
     if not _HIP_AVAILABLE or input.device.type != "cuda":
         return False
     if input.dtype not in _SUPPORTED_DTYPES:
@@ -83,15 +77,12 @@ def _common_supported(
 
 
 def _fused_rms_norm_fwd_perf_wins(input: torch.Tensor, n: int) -> bool:
-    # Tuned on MI355. Keep only regions where benchmarks show at least a
-    # 10% win over ATen; fp32 and smaller shapes stay on ATen.
-    if input.dtype not in (torch.float16, torch.bfloat16):
-        return False
     rows_m = input.numel() // n
+    # Tuned on MI355.
     return (
-        (4096 <= n < 8192 and rows_m >= 32768)
-        or (8192 <= n < 16384 and rows_m >= 8192)
-        or (n >= 16384 and rows_m >= 4096)
+        (4096 <= n < 8192 and rows_m >= 8192)
+        or (8192 <= n < 16384 and rows_m >= 4096)
+        or (n >= 16384 and rows_m >= 2048)
     )
 
 
