@@ -149,3 +149,88 @@ def get_gemm_configs() -> list[dict[str, object]]:
     else:
         configs = [get_default_gemm_configs()[0]]
     return [asdict(gemm_config) for gemm_config in configs]
+
+
+@dataclass(frozen=True)
+class FlyDSLGroupedGemmConfig:
+    TILE_M: int
+    TILE_N: int = 128
+    TILE_K: int = 64
+    STAGES: int = 2
+    SPLIT_K: int = 1
+    BLOCK_M_WARPS: int = 1
+    BLOCK_N_WARPS: int = 4
+    BLOCK_K_WARPS: int = 1
+    GROUP_M: int = 0
+    B_TO_LDS: bool = True
+    USE_HALF_TILE_INTERLEAVED: bool = False
+
+
+def get_grouped_gemm_configs(m: int, n: int, k: int) -> list[dict[str, object]]:
+    """Return grouped GEMM configs for the persistent multi-stage kernel.
+
+    The grouped path reuses the dense gemm_gfx950 compute with a multi-stage
+    software pipeline: A via async buffer_load_lds, B vectorized-gathered (one
+    128-bit global load of contiguous N per thread, mat2 is [G, K, N]) then
+    scatter-written into the K-swizzled LDS. STAGES>=3 exposes the pipeline
+    overlap (STAGES=2 degenerates to a drained double buffer). Configs are
+    validated against the shared gemm_gfx950 param so autotuning never offers an
+    unbuildable tile.
+    """
+    candidates = [
+        # Small-M grouped/decode configs.  These reduce wasted work when each
+        # group has far fewer than 32 rows.
+        FlyDSLGroupedGemmConfig(
+            TILE_M=16, TILE_N=64, BLOCK_M_WARPS=1, BLOCK_N_WARPS=2
+        ),
+        FlyDSLGroupedGemmConfig(
+            TILE_M=16, TILE_N=128, BLOCK_M_WARPS=1, BLOCK_N_WARPS=2
+        ),
+        FlyDSLGroupedGemmConfig(
+            TILE_M=32, TILE_N=64, BLOCK_M_WARPS=1, BLOCK_N_WARPS=2
+        ),
+        FlyDSLGroupedGemmConfig(
+            TILE_M=32, TILE_N=256, BLOCK_M_WARPS=1, BLOCK_N_WARPS=4
+        ),
+        FlyDSLGroupedGemmConfig(TILE_M=32, TILE_N=128),
+        FlyDSLGroupedGemmConfig(TILE_M=64, TILE_N=128),
+        FlyDSLGroupedGemmConfig(TILE_M=64, TILE_N=256),
+        FlyDSLGroupedGemmConfig(TILE_M=128, TILE_N=128),
+        # Deeper pipelines, autotuned for the multi-stage overlap.
+        FlyDSLGroupedGemmConfig(TILE_M=64, TILE_N=128, STAGES=3),
+        FlyDSLGroupedGemmConfig(TILE_M=128, TILE_N=128, STAGES=3),
+        # 2x2 half-tile-interleaved variant (stages=2 only): four half-block
+        # accumulators + per-quadrant cshuffle store for better register tiling
+        # and MMA scheduling. Requires m_waves=2, n_waves>=2 and even tiles.
+        FlyDSLGroupedGemmConfig(
+            TILE_M=64, TILE_N=128, BLOCK_M_WARPS=2, BLOCK_N_WARPS=2,
+            USE_HALF_TILE_INTERLEAVED=True,
+        ),
+        FlyDSLGroupedGemmConfig(
+            TILE_M=128, TILE_N=128, BLOCK_M_WARPS=2, BLOCK_N_WARPS=2,
+            USE_HALF_TILE_INTERLEAVED=True,
+        ),
+        FlyDSLGroupedGemmConfig(
+            TILE_M=128, TILE_N=256, BLOCK_M_WARPS=2, BLOCK_N_WARPS=4,
+            USE_HALF_TILE_INTERLEAVED=True,
+        ),
+        FlyDSLGroupedGemmConfig(
+            TILE_M=256, TILE_N=256, BLOCK_M_WARPS=2, BLOCK_N_WARPS=4,
+            USE_HALF_TILE_INTERLEAVED=True,
+        ),
+    ]
+    configs: list[dict[str, object]] = []
+    for grouped_config in candidates:
+        if grouped_config.TILE_M > max(128, m):
+            continue
+        if n < grouped_config.TILE_N or n % grouped_config.TILE_N != 0:
+            continue
+        if (k // grouped_config.TILE_K) < grouped_config.STAGES:
+            continue
+        gemm_config = asdict(grouped_config)
+        try:
+            _make_gemm_param(gemm_config)
+        except Exception:
+            continue
+        configs.append(gemm_config)
+    return configs
