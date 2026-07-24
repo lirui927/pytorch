@@ -277,6 +277,14 @@ def get_grouped_gemm_configs(m: int, n: int, k: int) -> list[dict[str, object]]:
         ),
         FlyDSLGroupedGemmConfig(
             TILE_M=256,
+            TILE_N=128,
+            BLOCK_M_WARPS=2,
+            BLOCK_N_WARPS=2,
+            B_TO_LDS=True,
+            USE_HALF_TILE_INTERLEAVED=True,
+        ),
+        FlyDSLGroupedGemmConfig(
+            TILE_M=256,
             TILE_N=256,
             BLOCK_M_WARPS=2,
             BLOCK_N_WARPS=4,

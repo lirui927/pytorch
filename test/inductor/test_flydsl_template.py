@@ -384,6 +384,71 @@ class TestFlyDSLTemplate(TestCase):
     @unittest.skipUnless(HAS_FLYDSL, "requires flydsl")
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA/ROCm not available")
     @unittest.skipIf(torch.version.hip is None, "requires ROCm")
+    def test_flydsl_grouped_grid_and_hti_config(self):
+        if not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx950"):
+            self.skipTest("requires gfx950")
+
+        from torch._inductor.heuristics.template.flydsl import get_grouped_gemm_configs
+        from torch._inductor.kernel.vendored_templates.flydsl.kernels.grouped_gemm_gfx950 import (
+            get_grouped_gemm_persistent_grid_size,
+            make_grouped_gemm_gfx950_param,
+        )
+
+        properties = SimpleNamespace(
+            multi_processor_count=256,
+            shared_memory_per_multiprocessor=163840,
+            max_threads_per_multi_processor=2048,
+        )
+        hti_128x128 = make_grouped_gemm_gfx950_param(
+            block_m=128,
+            block_n=128,
+            block_k=64,
+            m_waves=2,
+            n_waves=2,
+            b_to_lds=True,
+            use_half_tile_interleaved=True,
+        )
+        self.assertEqual(
+            get_grouped_gemm_persistent_grid_size(
+                hti_128x128, 2048, 4096, 4, properties
+            ),
+            512,
+        )
+        self.assertEqual(
+            get_grouped_gemm_persistent_grid_size(hti_128x128, 1, 128, 1, properties),
+            1,
+        )
+
+        hti_256x128 = make_grouped_gemm_gfx950_param(
+            block_m=256,
+            block_n=128,
+            block_k=64,
+            m_waves=2,
+            n_waves=2,
+            b_to_lds=True,
+            use_half_tile_interleaved=True,
+        )
+        self.assertEqual(
+            get_grouped_gemm_persistent_grid_size(
+                hti_256x128, 2048, 4096, 4, properties
+            ),
+            256,
+        )
+        self.assertTrue(
+            any(
+                config["TILE_M"] == 256
+                and config["TILE_N"] == 128
+                and config["BLOCK_M_WARPS"] == 2
+                and config["BLOCK_N_WARPS"] == 2
+                and config["B_TO_LDS"]
+                and config["USE_HALF_TILE_INTERLEAVED"]
+                for config in get_grouped_gemm_configs(2048, 4096, 4096)
+            )
+        )
+
+    @unittest.skipUnless(HAS_FLYDSL, "requires flydsl")
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA/ROCm not available")
+    @unittest.skipIf(torch.version.hip is None, "requires ROCm")
     @torch._inductor.config.patch(
         max_autotune=True,
         max_autotune_gemm_backends="FLYDSL",
@@ -451,6 +516,56 @@ class TestFlyDSLTemplate(TestCase):
         max_autotune_gemm_backends="FLYDSL",
         autotune_fallback_to_aten=False,
     )
+    def test_flydsl_grouped_mm_hti_b_lds_persistent_e2e(self):
+        from torch._inductor.heuristics.template import flydsl as flydsl_heuristics
+        from torch._inductor.heuristics.template.flydsl import FlyDSLGroupedGemmConfig
+        from torch._inductor.utils import run_and_get_code
+
+        if not flydsl_utils.runtime_available():
+            self.skipTest("FlyDSL runtime unavailable")
+        if not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx950"):
+            self.skipTest("requires gfx950")
+
+        group_sizes = torch.tensor([4096], device="cuda", dtype=torch.int32)
+        offs = group_sizes.cumsum(0).to(torch.int32)
+        k = 288
+        n = 8192
+        a = torch.randn(int(group_sizes.sum()), k, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(group_sizes.numel(), k, n, device="cuda", dtype=torch.bfloat16)
+        config = FlyDSLGroupedGemmConfig(
+            TILE_M=256,
+            TILE_N=256,
+            TILE_K=64,
+            STAGES=2,
+            BLOCK_M_WARPS=2,
+            BLOCK_N_WARPS=4,
+            B_TO_LDS=True,
+            USE_HALF_TILE_INTERLEAVED=True,
+        )
+
+        def grouped_mm(a, b, offs):
+            return F.grouped_mm(a, b, offs=offs)
+
+        expected = grouped_mm(a, b, offs)
+        torch._dynamo.reset()
+        with mock.patch.object(
+            flydsl_heuristics,
+            "get_grouped_gemm_configs",
+            return_value=[asdict(config)],
+        ):
+            compiled = torch.compile(grouped_mm, fullgraph=True)
+            actual, (code,) = run_and_get_code(compiled, a, b, offs)
+        self.assertIn("_flydsl_grouped_mm", code)
+        self.assertEqual(actual, expected, atol=3e-2, rtol=3e-2)
+
+    @unittest.skipUnless(HAS_FLYDSL, "requires flydsl")
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA/ROCm not available")
+    @unittest.skipIf(torch.version.hip is None, "requires ROCm")
+    @torch._inductor.config.patch(
+        max_autotune=True,
+        max_autotune_gemm_backends="FLYDSL",
+        autotune_fallback_to_aten=False,
+    )
     def test_flydsl_grouped_mm_b_lds_e2e(self):
         from torch._inductor.heuristics.template import flydsl as flydsl_heuristics
         from torch._inductor.heuristics.template.flydsl import FlyDSLGroupedGemmConfig
@@ -491,6 +606,39 @@ class TestFlyDSLTemplate(TestCase):
                 256,
             ),
         ]
+        if torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx950"):
+            configs.append(
+                (
+                    FlyDSLGroupedGemmConfig(
+                        TILE_M=256,
+                        TILE_N=128,
+                        TILE_K=64,
+                        STAGES=2,
+                        BLOCK_M_WARPS=2,
+                        BLOCK_N_WARPS=2,
+                        B_TO_LDS=True,
+                        USE_HALF_TILE_INTERLEAVED=True,
+                    ),
+                    96,
+                    128,
+                )
+            )
+            configs.append(
+                (
+                    FlyDSLGroupedGemmConfig(
+                        TILE_M=256,
+                        TILE_N=128,
+                        TILE_K=64,
+                        STAGES=2,
+                        BLOCK_M_WARPS=2,
+                        BLOCK_N_WARPS=2,
+                        B_TO_LDS=True,
+                        USE_HALF_TILE_INTERLEAVED=True,
+                    ),
+                    192,
+                    128,
+                )
+            )
 
         def grouped_mm(a, b, offs):
             return F.grouped_mm(a, b, offs=offs)
