@@ -166,10 +166,9 @@ class FlyDSLGroupedGemmConfig:
 def get_grouped_gemm_configs(m: int, n: int, k: int) -> list[dict[str, object]]:
     """Return grouped GEMM configs for the persistent multi-stage kernel.
 
-    Grouped kernels stage A with async buffer_load_lds and load B directly into
-    MFMA registers from the N-contiguous [G, K, N] input. Configs are validated
-    against the shared gemm_gfx950 param so autotuning never offers an
-    unbuildable tile.
+    Grouped kernels either gather B directly into MFMA registers or stage
+    N-contiguous B vectors into LDS. Configs are validated against the shared
+    gemm_gfx950 param so autotuning never offers an unbuildable tile.
     """
     candidates = [
         # Small-M grouped/decode configs.  These reduce wasted work when each
@@ -189,6 +188,13 @@ def get_grouped_gemm_configs(m: int, n: int, k: int) -> list[dict[str, object]]:
         # Deeper pipelines, autotuned for the multi-stage overlap.
         FlyDSLGroupedGemmConfig(TILE_M=64, TILE_N=128, STAGES=3),
         FlyDSLGroupedGemmConfig(TILE_M=128, TILE_N=128, STAGES=3),
+        # Normal-kernel B-to-LDS pipeline candidates. Keep the direct-B
+        # configurations above as alternatives because their smaller register
+        # and shared-memory footprints can win on some grouped shapes.
+        FlyDSLGroupedGemmConfig(TILE_M=128, TILE_N=128, B_TO_LDS=True),
+        FlyDSLGroupedGemmConfig(TILE_M=128, TILE_N=128, STAGES=3, B_TO_LDS=True),
+        FlyDSLGroupedGemmConfig(TILE_M=128, TILE_N=256, B_TO_LDS=True),
+        FlyDSLGroupedGemmConfig(TILE_M=128, TILE_N=256, STAGES=3, B_TO_LDS=True),
         # 2x2 half-tile-interleaved variant (stages=2 only): four half-block
         # accumulators + per-quadrant cshuffle store for better register tiling
         # and MMA scheduling. Requires m_waves=2, n_waves>=2 and even tiles.

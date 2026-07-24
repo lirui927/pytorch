@@ -377,8 +377,8 @@ class _GemmGfx950Ctx:
         self.pred_C = pred_C
         self.wave_offset = wave_offset
         # Grouped-only: per-lane (n, k) coordinates of each frag_B element in the
-        # (block_n, block_k) B tile, so B can be gathered directly from the
-        # N-contiguous global [G, K, N] into registers without LDS staging.
+        # (block_n, block_k) B tile. The direct path gathers them from global B;
+        # the LDS path uses the same mapping to materialize the MFMA fragment.
         self.thr_mma_bN = thr_mma_bN
         self.thr_mma_bK = thr_mma_bK
 
@@ -441,6 +441,15 @@ def _gemm_gfx950_setup(out, a, b, bias, tiled_mma, param, grouped):
             fx.make_ordered_layout((rows, block_k), (1, 0)),
         )
 
+    def make_grouped_b_lds_layout():
+        # B is physically [K, N] in the grouped ABI. Swizzle bits begin above
+        # the eight-element N vector, so each 16-byte global load remains
+        # contiguous at its LDS destination.
+        return fx.make_composed_layout(
+            swizzle,
+            fx.make_ordered_layout((block_k, block_n), (1, 0)),
+        )
+
     a_lds_layout = make_lds_layout(block_m)
     c_lds_layout = fx.make_layout((block_m, block_n), (block_n, 1))
 
@@ -450,8 +459,8 @@ def _gemm_gfx950_setup(out, a, b, bias, tiled_mma, param, grouped):
     frag_A = thr_mma.make_fragment_A(sA)
     if const_expr(grouped):
         # Coordinate views over the (block_n, block_k) B tile: partition_B maps
-        # each frag_B element to its in-tile (n, k) so the grouped loader can
-        # strided-gather from global B directly into registers (no LDS).
+        # each frag_B element to its in-tile (n, k) for either global gathers or
+        # the manually staged [K, N] LDS tile.
         bn_coords = fx.make_view(0, fx.make_layout((block_n, block_k), (1, 0)))
         bk_coords = fx.make_view(0, fx.make_layout((block_n, block_k), (0, 1)))
         thr_mma_bN = thr_mma.partition_B(bn_coords)
@@ -460,11 +469,17 @@ def _gemm_gfx950_setup(out, a, b, bias, tiled_mma, param, grouped):
         thr_mma_bN = None
         thr_mma_bK = None
     if const_expr(param.b_to_lds):
-        b_lds_layout = make_lds_layout(block_n)
-        sB = fx.make_view(smem_b, b_lds_layout)
-        frag_B = thr_mma.make_fragment_B(sB)
-        thr_copy_B = fx.make_tiled_copy_B(g2r_copy_atom, tiled_mma).get_slice(tid)
-        frag_B_retile = thr_copy_B.retile(frag_B)
+        if const_expr(grouped):
+            b_lds_layout = make_grouped_b_lds_layout()
+            frag_B = fx.make_fragment_like(thr_mma_bN, elem_dtype)
+            thr_copy_B = None
+            frag_B_retile = None
+        else:
+            b_lds_layout = make_lds_layout(block_n)
+            sB = fx.make_view(smem_b, b_lds_layout)
+            frag_B = thr_mma.make_fragment_B(sB)
+            thr_copy_B = fx.make_tiled_copy_B(g2r_copy_atom, tiled_mma).get_slice(tid)
+            frag_B_retile = thr_copy_B.retile(frag_B)
     else:
         b_lds_layout = None
         frag_B = fx.make_fragment_like(thr_mma_bN, elem_dtype)
@@ -710,6 +725,48 @@ def _grouped_compute_stage(ctx, b_flat, read_stage, k_tile, n, k, bid_n, group_i
         compute_k_chunk(block_k_iter)
 
 
+def _grouped_compute_stage_from_lds(ctx, read_stage, k_tile, k):
+    """Read one grouped A/B k-tile from LDS and accumulate into ``frag_C``."""
+    param = ctx.param
+    block_m = param.block_m
+    block_n = param.block_n
+    block_k = param.block_k
+    sA_stage = fx.make_view(
+        ctx.smem_a + read_stage * block_m * block_k, ctx.a_lds_layout
+    )
+    sB_stage = fx.make_view(
+        ctx.smem_b + read_stage * block_n * block_k, ctx.b_lds_layout
+    )
+    thr_sA_s2r = ctx.thr_copy_A.partition_S(sA_stage)
+
+    for i in range_constexpr(fx.size(ctx.frag_B.shape).unpack()):
+        k_local_idx = fx.get_scalar(ctx.thr_mma_bK[i])
+        n_local_idx = fx.get_scalar(ctx.thr_mma_bN[i])
+        in_bounds = k_tile * block_k + k_local_idx < k
+        value = sB_stage[k_local_idx, n_local_idx]
+        # The vector producer maps invalid K rows to row zero; zero them before
+        # the MFMA consumes the staged fragment.
+        ctx.frag_B[i] = in_bounds.select(value, _elem_dtype(param)(0.0))
+
+    def compute_k_chunk(block_k_iter):
+        fx.copy(
+            ctx.s2r_copy_atom,
+            thr_sA_s2r[None, None, block_k_iter],
+            ctx.frag_A_retile[None, None, block_k_iter],
+        )
+        fx.gemm(
+            ctx.tiled_mma,
+            ctx.frag_C,
+            ctx.frag_A[None, None, block_k_iter],
+            ctx.frag_B[None, None, block_k_iter],
+            ctx.frag_C,
+            traversal_order=fx.GemmTraversalOrder.KNM,
+        )
+
+    for block_k_iter in range_constexpr(block_k // param.mma_k):
+        compute_k_chunk(block_k_iter)
+
+
 def _gemm_tile_store(ctx, thr_gC):
     """Write frag_C back to global memory through the shared-memory cshuffle."""
     frag_C_out = ctx.frag_C_out
@@ -896,6 +953,43 @@ def _grouped_load_a_tile_async(ctx, row_base, bid_m, m, k, k_tile, stage):
         global_offset = (safe_global_m_idx * k + safe_global_k_idx) * in_data_bytes
         buffer_load_lds_inline(ctx.a_rsrc, lds_ptr, global_offset, async_load_bytes)
         if i < ldg_a_iters - 1:
+            lds_ptr = lds_ptr + block_threads * async_load_bytes
+
+
+def _grouped_load_b_tile_async(ctx, bid_n, n, k, group_idx, k_tile, stage):
+    """Async-load one grouped B tile from global [G, K, N] into swizzled LDS."""
+    param = ctx.param
+    block_n = param.block_n
+    block_k = param.block_k
+    async_load_bytes = param.async_load_bytes
+    in_data_bytes = param.in_data_bytes
+    async_load_vec_size = async_load_bytes // in_data_bytes
+    block_threads = param.block_threads
+    ldg_b_iters = param.ldg_b_iters
+    n_vectors = block_n // async_load_vec_size
+    lds_ptr = fx.recast_iter(
+        fx.Int8, ctx.smem_b + stage * block_n * block_k
+    ) + fx.Int32(ctx.wave_offset)
+
+    for i in range_constexpr(ldg_b_iters):
+        vector_idx = block_threads * i + ctx.tid
+        k_local_idx = vector_idx // n_vectors
+        n_local_idx = vector_idx % n_vectors * async_load_vec_size
+        global_k_idx = k_tile * block_k + k_local_idx
+        # Swizzle(3, 3, 3) is self-inverse. The natural LDS destination
+        # address is therefore paired with the same swizzled N coordinate in
+        # global memory, while preserving each aligned 16-byte N vector.
+        swizzled_n_idx = (
+            fx.get_scalar(fx.crd2idx((k_local_idx, n_local_idx), ctx.b_lds_layout))
+            % block_n
+        )
+        global_n_idx = bid_n * block_n + swizzled_n_idx
+        safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
+        global_offset = (
+            group_idx * k * n + safe_global_k_idx * n + global_n_idx
+        ) * in_data_bytes
+        buffer_load_lds_inline(ctx.b_rsrc, lds_ptr, global_offset, async_load_bytes)
+        if i < ldg_b_iters - 1:
             lds_ptr = lds_ptr + block_threads * async_load_bytes
 
 
@@ -1723,45 +1817,99 @@ def gemm_gfx950_grouped_kernel(
             bid_m = local_tile % num_pid_m
             bid_n = local_tile // num_pid_m
 
-            # Multi-stage software pipeline for A only. A reuses dense's async
-            # buffer_load_lds (K-contiguous, offset by the group's row_base) and is
-            # staged through LDS. B is N-contiguous and register-gathered directly
-            # from global into frag_B inside _grouped_compute_stage (no LDS), so
-            # there is no cross-lane transpose and no B ds_write. __barrier waits A's
-            # DMA vmcnt; fx.gpu.barrier fences A's LDS before the s2r read.
             thr_gC = _gemm_tile_init(ctx, bid_m, bid_n, m_g, n, row_base)
-            for stage in range_constexpr(stages - 1):
-                _grouped_load_a_tile_async(ctx, row_base, bid_m, m_g, k, stage, stage)
-            rocdl.sched_barrier(0)
-            if const_expr(has_k_tail):
-                main_loop_end = (k_tiles > stages - 1).select(k_tiles - (stages - 1), 0)
+            if const_expr(param.b_to_lds):
+                ldg_wait_count = ldg_a_iters + param.ldg_b_iters
+                for stage in range_constexpr(stages - 1):
+                    _grouped_load_b_tile_async(ctx, bid_n, n, k, g, stage, stage)
+                    _grouped_load_a_tile_async(
+                        ctx, row_base, bid_m, m_g, k, stage, stage
+                    )
+                rocdl.sched_barrier(0)
+                if const_expr(has_k_tail):
+                    main_loop_end = (k_tiles > stages - 1).select(
+                        k_tiles - (stages - 1), 0
+                    )
+                else:
+                    main_loop_end = k_tiles - (stages - 1)
+                for k_tile in range(0, main_loop_end, 1):
+                    current_stage = k_tile % stages
+                    write_stage = (current_stage + stages - 1) % stages
+                    __barrier((stages - 2) * ldg_wait_count)
+                    fx.gpu.barrier()
+                    _grouped_load_b_tile_async(
+                        ctx,
+                        bid_n,
+                        n,
+                        k,
+                        g,
+                        k_tile + (stages - 1),
+                        write_stage,
+                    )
+                    _grouped_load_a_tile_async(
+                        ctx,
+                        row_base,
+                        bid_m,
+                        m_g,
+                        k,
+                        k_tile + (stages - 1),
+                        write_stage,
+                    )
+                    _grouped_compute_stage_from_lds(ctx, current_stage, k_tile, k)
+                current_stage = main_loop_end % stages
+                for s in range_constexpr(0, stages - 1):
+                    __barrier((stages - 2 - s) * ldg_wait_count)
+                    fx.gpu.barrier()
+                    _grouped_compute_stage_from_lds(
+                        ctx, current_stage, main_loop_end + s, k
+                    )
+                    current_stage = (current_stage + 1) % stages
             else:
-                main_loop_end = k_tiles - (stages - 1)
-            for k_tile in range(0, main_loop_end, 1):
-                current_stage = k_tile % stages
-                write_stage = (current_stage + stages - 1) % stages
-                __barrier((stages - 2) * ldg_a_iters)
-                fx.gpu.barrier()
-                _grouped_load_a_tile_async(
-                    ctx,
-                    row_base,
-                    bid_m,
-                    m_g,
-                    k,
-                    k_tile + (stages - 1),
-                    write_stage,
-                )
-                _grouped_compute_stage(
-                    ctx, b_flat, current_stage, k_tile, n, k, bid_n, g
-                )
-            current_stage = main_loop_end % stages
-            for s in range_constexpr(0, stages - 1):
-                __barrier((stages - 2 - s) * ldg_a_iters)
-                fx.gpu.barrier()
-                _grouped_compute_stage(
-                    ctx, b_flat, current_stage, main_loop_end + s, n, k, bid_n, g
-                )
-                current_stage = (current_stage + 1) % stages
+                # The direct path remains an A-only asynchronous pipeline. B is
+                # gathered into its native MFMA register layout at consumption.
+                for stage in range_constexpr(stages - 1):
+                    _grouped_load_a_tile_async(
+                        ctx, row_base, bid_m, m_g, k, stage, stage
+                    )
+                rocdl.sched_barrier(0)
+                if const_expr(has_k_tail):
+                    main_loop_end = (k_tiles > stages - 1).select(
+                        k_tiles - (stages - 1), 0
+                    )
+                else:
+                    main_loop_end = k_tiles - (stages - 1)
+                for k_tile in range(0, main_loop_end, 1):
+                    current_stage = k_tile % stages
+                    write_stage = (current_stage + stages - 1) % stages
+                    __barrier((stages - 2) * ldg_a_iters)
+                    fx.gpu.barrier()
+                    _grouped_load_a_tile_async(
+                        ctx,
+                        row_base,
+                        bid_m,
+                        m_g,
+                        k,
+                        k_tile + (stages - 1),
+                        write_stage,
+                    )
+                    _grouped_compute_stage(
+                        ctx, b_flat, current_stage, k_tile, n, k, bid_n, g
+                    )
+                current_stage = main_loop_end % stages
+                for s in range_constexpr(0, stages - 1):
+                    __barrier((stages - 2 - s) * ldg_a_iters)
+                    fx.gpu.barrier()
+                    _grouped_compute_stage(
+                        ctx,
+                        b_flat,
+                        current_stage,
+                        main_loop_end + s,
+                        n,
+                        k,
+                        bid_n,
+                        g,
+                    )
+                    current_stage = (current_stage + 1) % stages
             _gemm_tile_store(ctx, thr_gC)
 
         remaining = (work_idx < tiles_after).select(tiles_after - work_idx, fx.Int32(0))
@@ -1783,6 +1931,10 @@ def launch_gemm_gfx950_grouped(
     param: GemmGfx950Param,
     stream: fx.Stream = fx.Stream(None),
 ):
+    if const_expr(param.use_half_tile_interleaved and param.b_to_lds):
+        raise ValueError(
+            "grouped half-tile-interleaved GEMM does not support B_TO_LDS yet"
+        )
     elem_dtype = _elem_dtype(param)
     mma_atom = fx.make_mma_atom(
         fx.rocdl.MFMA(param.mma_m, param.mma_n, param.mma_k, elem_dtype)
