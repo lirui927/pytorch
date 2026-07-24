@@ -72,9 +72,8 @@ PyObject* FlyDSLMMFp16Bf16CWrapper_new(
     PyObject* args,
     PyObject* kwds) {
   HANDLE_TH_ERRORS
-  auto* self =
-      reinterpret_cast<FlyDSLMMFp16Bf16CWrapperObject*>(
-          type->tp_alloc(type, 0));
+  auto* self = reinterpret_cast<FlyDSLMMFp16Bf16CWrapperObject*>(
+      type->tp_alloc(type, 0));
   if (!self) {
     return nullptr;
   }
@@ -130,7 +129,8 @@ PyTypeObject FlyDSLMMFp16Bf16CWrapperType = {
     0, // tp_itemsize
     FlyDSLMMFp16Bf16CWrapper_dealloc, // tp_dealloc
     offsetof(
-        FlyDSLMMFp16Bf16CWrapperObject, vectorcall), // tp_vectorcall_offset
+        FlyDSLMMFp16Bf16CWrapperObject,
+        vectorcall), // tp_vectorcall_offset
     nullptr, // tp_getattr
     nullptr, // tp_setattr
     nullptr, // tp_reserved
