@@ -340,6 +340,8 @@ class _GemmGfx950Ctx:
         wave_offset,
         thr_mma_bN=None,
         thr_mma_bK=None,
+        b_s2r_copy_atom=None,
+        b_lds_s2r_layout=None,
     ):
         self.grouped = grouped
         self.param = param
@@ -381,6 +383,8 @@ class _GemmGfx950Ctx:
         # the LDS path uses the same mapping to materialize the MFMA fragment.
         self.thr_mma_bN = thr_mma_bN
         self.thr_mma_bK = thr_mma_bK
+        self.b_s2r_copy_atom = b_s2r_copy_atom
+        self.b_lds_s2r_layout = b_lds_s2r_layout
 
 
 def _gemm_gfx950_setup(out, a, b, bias, tiled_mma, param, grouped):
@@ -450,6 +454,15 @@ def _gemm_gfx950_setup(out, a, b, bias, tiled_mma, param, grouped):
             fx.make_ordered_layout((block_k, block_n), (1, 0)),
         )
 
+    def make_grouped_b_lds_s2r_layout():
+        # Reinterpret the [K, N] physical buffer as logical [N, K] for the
+        # B operand. The transpose-read atom turns N-contiguous LDS rows into
+        # the K-oriented MFMA register fragment.
+        return fx.make_composed_layout(
+            swizzle,
+            fx.make_layout((block_n, block_k), (1, block_n)),
+        )
+
     a_lds_layout = make_lds_layout(block_m)
     c_lds_layout = fx.make_layout((block_m, block_n), (block_n, 1))
 
@@ -471,20 +484,29 @@ def _gemm_gfx950_setup(out, a, b, bias, tiled_mma, param, grouped):
     if const_expr(param.b_to_lds):
         if const_expr(grouped):
             b_lds_layout = make_grouped_b_lds_layout()
-            frag_B = fx.make_fragment_like(thr_mma_bN, elem_dtype)
-            thr_copy_B = None
-            frag_B_retile = None
+            b_lds_s2r_layout = make_grouped_b_lds_s2r_layout()
+            sB = fx.make_view(smem_b, b_lds_s2r_layout)
+            frag_B = thr_mma.make_fragment_B(sB)
+            b_s2r_copy_atom = fx.make_copy_atom(
+                rocdl.cdna4.LDSReadTrans16_64b(), elem_dtype
+            )
+            thr_copy_B = fx.make_tiled_copy_B(b_s2r_copy_atom, tiled_mma).get_slice(tid)
+            frag_B_retile = thr_copy_B.retile(frag_B)
         else:
             b_lds_layout = make_lds_layout(block_n)
+            b_lds_s2r_layout = b_lds_layout
             sB = fx.make_view(smem_b, b_lds_layout)
             frag_B = thr_mma.make_fragment_B(sB)
             thr_copy_B = fx.make_tiled_copy_B(g2r_copy_atom, tiled_mma).get_slice(tid)
             frag_B_retile = thr_copy_B.retile(frag_B)
+            b_s2r_copy_atom = s2r_copy_atom
     else:
         b_lds_layout = None
+        b_lds_s2r_layout = None
         frag_B = fx.make_fragment_like(thr_mma_bN, elem_dtype)
         thr_copy_B = None
         frag_B_retile = None
+        b_s2r_copy_atom = None
     # Accumulator fragment shape is derived from the (block_m, block_n) C tile;
     # build it from sC (a real memref) so it is reusable across output tiles.
     frag_C = thr_mma.make_fragment_C(sC)
@@ -562,6 +584,8 @@ def _gemm_gfx950_setup(out, a, b, bias, tiled_mma, param, grouped):
         wave_offset,
         thr_mma_bN,
         thr_mma_bK,
+        b_s2r_copy_atom,
+        b_lds_s2r_layout,
     )
 
 
@@ -735,20 +759,25 @@ def _grouped_compute_stage_from_lds(ctx, read_stage, k_tile, k):
         ctx.smem_a + read_stage * block_m * block_k, ctx.a_lds_layout
     )
     sB_stage = fx.make_view(
-        ctx.smem_b + read_stage * block_n * block_k, ctx.b_lds_layout
+        ctx.smem_b + read_stage * block_n * block_k, ctx.b_lds_s2r_layout
     )
     thr_sA_s2r = ctx.thr_copy_A.partition_S(sA_stage)
-
-    for i in range_constexpr(fx.size(ctx.frag_B.shape).unpack()):
-        k_local_idx = fx.get_scalar(ctx.thr_mma_bK[i])
-        n_local_idx = fx.get_scalar(ctx.thr_mma_bN[i])
-        in_bounds = k_tile * block_k + k_local_idx < k
-        value = sB_stage[k_local_idx, n_local_idx]
-        # The vector producer maps invalid K rows to row zero; zero them before
-        # the MFMA consumes the staged fragment.
-        ctx.frag_B[i] = in_bounds.select(value, _elem_dtype(param)(0.0))
+    thr_sB_s2r = ctx.thr_copy_B.partition_S(sB_stage)
 
     def compute_k_chunk(block_k_iter):
+        fx.copy(
+            ctx.b_s2r_copy_atom,
+            thr_sB_s2r[None, None, block_k_iter],
+            ctx.frag_B_retile[None, None, block_k_iter],
+        )
+        if const_expr(param.has_k_tail):
+            frag_B_chunk = ctx.frag_B[None, None, block_k_iter]
+            bK_chunk = ctx.thr_mma_bK[None, None, block_k_iter]
+            for i in range_constexpr(fx.size(frag_B_chunk.shape).unpack()):
+                in_bounds = k_tile * block_k + fx.get_scalar(bK_chunk[i]) < k
+                frag_B_chunk[i] = in_bounds.select(
+                    frag_B_chunk[i], _elem_dtype(param)(0.0)
+                )
         fx.copy(
             ctx.s2r_copy_atom,
             thr_sA_s2r[None, None, block_k_iter],
