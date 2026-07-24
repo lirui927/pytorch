@@ -418,6 +418,12 @@ class TestFlyDSLTemplate(TestCase):
             get_grouped_gemm_persistent_grid_size(hti_128x128, 1, 128, 1, properties),
             1,
         )
+        self.assertEqual(
+            get_grouped_gemm_persistent_grid_size(
+                hti_128x128, 2048, 2048, 4, properties
+            ),
+            304,
+        )
 
         hti_256x128 = make_grouped_gemm_gfx950_param(
             block_m=256,
@@ -434,6 +440,71 @@ class TestFlyDSLTemplate(TestCase):
             ),
             256,
         )
+        small_blds_64x128 = make_grouped_gemm_gfx950_param(
+            block_m=64,
+            block_n=128,
+            block_k=64,
+            m_waves=1,
+            n_waves=4,
+            b_to_lds=True,
+        )
+        self.assertEqual(
+            get_grouped_gemm_persistent_grid_size(
+                small_blds_64x128, 2048, 4096, 16, properties
+            ),
+            512,
+        )
+        # Uniform 64-row groups have only 512 tiles, so do not launch the
+        # extra empty CTAs that the ragged-M upper bound would permit.
+        self.assertEqual(
+            get_grouped_gemm_persistent_grid_size(
+                small_blds_64x128, 2048, 2048, 32, properties
+            ),
+            512,
+        )
+        small_blds_64x128_stages4 = make_grouped_gemm_gfx950_param(
+            block_m=64,
+            block_n=128,
+            block_k=64,
+            stages=4,
+            m_waves=1,
+            n_waves=4,
+            b_to_lds=True,
+        )
+        self.assertEqual(
+            get_grouped_gemm_persistent_grid_size(
+                small_blds_64x128_stages4, 2048, 4096, 16, properties
+            ),
+            256,
+        )
+        small_blds_64x64 = make_grouped_gemm_gfx950_param(
+            block_m=64,
+            block_n=64,
+            block_k=64,
+            m_waves=1,
+            n_waves=2,
+            b_to_lds=True,
+        )
+        self.assertEqual(
+            get_grouped_gemm_persistent_grid_size(
+                small_blds_64x64, 2048, 2048, 32, properties
+            ),
+            1024,
+        )
+        small_direct_32x64 = make_grouped_gemm_gfx950_param(
+            block_m=32,
+            block_n=64,
+            block_k=64,
+            m_waves=1,
+            n_waves=2,
+            b_to_lds=False,
+        )
+        self.assertEqual(
+            get_grouped_gemm_persistent_grid_size(
+                small_direct_32x64, 2048, 2048, 32, properties
+            ),
+            2048,
+        )
         self.assertTrue(
             any(
                 config["TILE_M"] == 256
@@ -443,6 +514,18 @@ class TestFlyDSLTemplate(TestCase):
                 and config["B_TO_LDS"]
                 and config["USE_HALF_TILE_INTERLEAVED"]
                 for config in get_grouped_gemm_configs(2048, 4096, 4096)
+            )
+        )
+        self.assertTrue(
+            any(
+                config["TILE_M"] == 64
+                and config["TILE_N"] == 128
+                and config["BLOCK_M_WARPS"] == 2
+                and config["BLOCK_N_WARPS"] == 2
+                and config["B_TO_LDS"]
+                and config["USE_HALF_TILE_INTERLEAVED"]
+                and config["FUSE_HTI_EPILOGUE"]
+                for config in get_grouped_gemm_configs(2048, 2048, 2048)
             )
         )
 
@@ -555,6 +638,62 @@ class TestFlyDSLTemplate(TestCase):
         ):
             compiled = torch.compile(grouped_mm, fullgraph=True)
             actual, (code,) = run_and_get_code(compiled, a, b, offs)
+        self.assertIn("_flydsl_grouped_mm", code)
+        self.assertEqual(actual, expected, atol=3e-2, rtol=3e-2)
+
+    @unittest.skipUnless(HAS_FLYDSL, "requires flydsl")
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA/ROCm not available")
+    @unittest.skipIf(torch.version.hip is None, "requires ROCm")
+    @torch._inductor.config.patch(
+        max_autotune=True,
+        max_autotune_gemm_backends="FLYDSL",
+        autotune_fallback_to_aten=False,
+    )
+    def test_flydsl_grouped_mm_hti_fused_epilogue_persistent_e2e(self):
+        from torch._inductor.heuristics.template import flydsl as flydsl_heuristics
+        from torch._inductor.heuristics.template.flydsl import FlyDSLGroupedGemmConfig
+        from torch._inductor.utils import run_and_get_code
+
+        if not flydsl_utils.runtime_available():
+            self.skipTest("FlyDSL runtime unavailable")
+        if not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx950"):
+            self.skipTest("requires gfx950")
+
+        group_sizes = torch.tensor(
+            [0, 1, 64, 128, 31, 96, 128] * 50,
+            device="cuda",
+            dtype=torch.int32,
+        )
+        offs = group_sizes.cumsum(0).to(torch.int32)
+        k = 288
+        n = 256
+        a = torch.randn(int(group_sizes.sum()), k, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(group_sizes.numel(), k, n, device="cuda", dtype=torch.bfloat16)
+        config = FlyDSLGroupedGemmConfig(
+            TILE_M=128,
+            TILE_N=256,
+            TILE_K=64,
+            STAGES=2,
+            BLOCK_M_WARPS=2,
+            BLOCK_N_WARPS=4,
+            B_TO_LDS=True,
+            USE_HALF_TILE_INTERLEAVED=True,
+            FUSE_HTI_EPILOGUE=True,
+        )
+
+        def grouped_mm(a, b, offs):
+            return F.grouped_mm(a, b, offs=offs)
+
+        expected = grouped_mm(a, b, offs)
+        torch._dynamo.reset()
+        with mock.patch.object(
+            flydsl_heuristics,
+            "get_grouped_gemm_configs",
+            return_value=[asdict(config)],
+        ):
+            compiled = torch.compile(grouped_mm, fullgraph=True)
+            actual, (code,) = run_and_get_code(compiled, a, b, offs)
+            self.assertEqual(compiled(a, b, offs), expected, atol=3e-2, rtol=3e-2)
         self.assertIn("_flydsl_grouped_mm", code)
         self.assertEqual(actual, expected, atol=3e-2, rtol=3e-2)
 

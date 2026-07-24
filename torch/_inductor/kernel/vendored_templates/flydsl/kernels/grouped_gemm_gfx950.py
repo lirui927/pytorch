@@ -92,6 +92,7 @@ class GroupedGemmGfx950Param:
     group_m: fx.Constexpr[int]
     b_to_lds: fx.Constexpr[bool]
     use_half_tile_interleaved: fx.Constexpr[bool]
+    fuse_hti_epilogue: fx.Constexpr[bool]
     has_bias: fx.Constexpr[bool]
     has_k_tail: fx.Constexpr[bool]
     has_odd_k_tiles: fx.Constexpr[bool]
@@ -132,6 +133,7 @@ def make_grouped_gemm_gfx950_param(
     group_m: int = 0,
     b_to_lds: bool = True,
     use_half_tile_interleaved: bool = False,
+    fuse_hti_epilogue: bool = False,
     has_bias: bool = False,
     has_k_tail: bool = False,
     has_odd_k_tiles: bool = False,
@@ -151,6 +153,8 @@ def make_grouped_gemm_gfx950_param(
         raise ValueError("m_waves and n_waves must be positive")
     if group_m < 0:
         raise ValueError("group_m must be non-negative")
+    if fuse_hti_epilogue and not use_half_tile_interleaved:
+        raise ValueError("fused HTI epilogue requires half-tile interleaving")
 
     in_dbytes = out_dbytes = 2
     cshuffle_vec_size = GFX950_DMA_BYTES // out_dbytes
@@ -262,6 +266,7 @@ def make_grouped_gemm_gfx950_param(
         group_m=group_m,
         b_to_lds=b_to_lds,
         use_half_tile_interleaved=use_half_tile_interleaved,
+        fuse_hti_epilogue=fuse_hti_epilogue,
         has_bias=has_bias,
         has_k_tail=has_k_tail,
         has_odd_k_tiles=has_odd_k_tiles,
@@ -305,21 +310,30 @@ def get_grouped_gemm_persistent_grid_size(
         device_properties, "max_threads_per_multi_processor", None
     )
     if shared_memory_per_cu is None or max_threads_per_cu is None:
-        blocks_per_cu = 1
+        resource_blocks_per_cu = 1
     else:
-        blocks_per_cu = min(
-            2,
+        resource_blocks_per_cu = min(
             max(int(shared_memory_per_cu) // smem_bytes, 1),
             max(int(max_threads_per_cu) // param.block_threads, 1),
         )
 
+    light_tile = param.block_m <= 64 and param.block_n <= 128
+    n_tiles = (n + param.block_n - 1) // param.block_n
+    if light_tile:
+        for blocks_per_cu in (8, 4, 2, 1):
+            if blocks_per_cu <= resource_blocks_per_cu:
+                break
+        # The host only knows total M. This lower bound prevents empty CTAs
+        # for uniformly small groups, even though ragged inputs have more work.
+        task_floor = (total_m + param.block_m - 1) // param.block_m * n_tiles
+        return max(1, min(num_cus * blocks_per_cu, task_floor))
+
+    blocks_per_cu = 2 if resource_blocks_per_cu >= 2 else 1
     nonempty_groups_upper = min(group_count, total_m)
     m_tiles_upper = (
         nonempty_groups_upper + (total_m - nonempty_groups_upper) // param.block_m
     )
-    n_tiles = (n + param.block_n - 1) // param.block_n
-    total_tiles_upper = m_tiles_upper * n_tiles
-    return max(1, min(num_cus * blocks_per_cu, total_tiles_upper))
+    return max(1, min(num_cus * blocks_per_cu, m_tiles_upper * n_tiles))
 
 
 def make_grouped_gemm_gfx950_kernel_name(param: GroupedGemmGfx950Param) -> str:
@@ -331,6 +345,7 @@ def make_grouped_gemm_gfx950_kernel_name(param: GroupedGemmGfx950Param) -> str:
     name += f"_w{param.m_waves}x{param.n_waves}"
     name += f"_gm{param.group_m}"
     name += f"_blds{int(param.b_to_lds)}"
+    name += f"_fep{int(param.fuse_hti_epilogue)}"
     name += f"_ktail{int(param.has_k_tail)}"
     name += f"_oddkt{int(param.has_odd_k_tiles)}"
     name += "_hti" if param.use_half_tile_interleaved else "_ft"
@@ -1030,6 +1045,7 @@ def gemm_hti_gfx950_grouped_kernel(
         b_s2r_copy_atom = None
         thr_copy_B = None
     c_lds_layout = fx.make_layout((half_block_m, half_block_n), (half_block_n, 1))
+    full_c_lds_layout = fx.make_layout((block_m, block_n), (block_n, 1))
     wave_offset = rocdl.readfirstlane(
         fx.Int64.ir_type,
         fx.Int64(tid // GFX950_WAVE_SIZE * GFX950_WAVE_SIZE * async_load_bytes),
@@ -1156,6 +1172,14 @@ def gemm_hti_gfx950_grouped_kernel(
             fx.make_layout((half_block_m, half_block_n), (n, 1)),
         )
 
+    def full_gC(bid_m, bid_n, row_base):
+        row = row_base + bid_m * block_m
+        col = bid_n * block_n
+        return fx.make_view(
+            fx.add_offset(fx.get_iter(out_buf), row * n + col),
+            fx.make_layout((block_m, block_n), (n, 1)),
+        )
+
     cshuffle_vec_size = GFX950_DMA_BYTES // param.out_data_bytes
     cshuffle_x_threads = half_block_n // cshuffle_vec_size
     cshuffle_thr_layout = fx.make_layout(
@@ -1179,6 +1203,30 @@ def gemm_hti_gfx950_grouped_kernel(
     thr_mma_cCol = thr_mma.partition_C(col_coords)
     thr_cRow = thr_copy_cshuffle.partition_S(row_coords)[(0, None), None, None]
     thr_cCol = thr_copy_cshuffle.partition_S(col_coords)[(0, None), None, None]
+    full_cshuffle_x_threads = block_n // cshuffle_vec_size
+    full_cshuffle_thr_layout = fx.make_layout(
+        (block_threads // full_cshuffle_x_threads, full_cshuffle_x_threads),
+        (full_cshuffle_x_threads, 1),
+    )
+    full_cshuffle_val_layout = fx.make_layout((1, cshuffle_vec_size), (1, 1))
+    full_cshuffle_tile, full_cshuffle_tv_layout = fx.make_layout_tv(
+        full_cshuffle_thr_layout,
+        full_cshuffle_val_layout,
+    )
+    full_tiled_copy_cshuffle = fx.make_tiled_copy(
+        r2g_copy_atom,
+        full_cshuffle_tv_layout,
+        full_cshuffle_tile,
+    )
+    full_thr_copy_cshuffle = full_tiled_copy_cshuffle.get_slice(tid)
+    full_row_coords = fx.make_view(0, fx.make_layout((block_m, block_n), (1, 0)))
+    full_col_coords = fx.make_view(0, fx.make_layout((block_m, block_n), (0, 1)))
+    full_thr_cRow = full_thr_copy_cshuffle.partition_S(full_row_coords)[
+        (0, None), None, None
+    ]
+    full_thr_cCol = full_thr_copy_cshuffle.partition_S(full_col_coords)[
+        (0, None), None, None
+    ]
     bn_coords = fx.make_view(0, fx.make_layout((half_block_n, block_k), (1, 0)))
     bk_coords = fx.make_view(0, fx.make_layout((half_block_n, block_k), (0, 1)))
     thr_mma_bN = thr_mma.partition_B(bn_coords)
@@ -1215,6 +1263,45 @@ def gemm_hti_gfx950_grouped_kernel(
             sC[row, col] = frag_C_out[i]
 
         fx.gpu.barrier()
+        fx.copy(s2r_copy_atom, thr_sC, frag_C_cshuffle)
+        fx.copy(r2g_copy_atom, frag_C_cshuffle, thr_gC, pred=pred_C)
+        fx.gpu.barrier()
+
+    def store_full_tile(bid_m, bid_n, c00, c01, c10, c11, m, row_base):
+        sC = fx.make_view(smem_c, full_c_lds_layout)
+
+        def store_fragment(m_part, n_part, frag_C):
+            frag_C_out = fx.make_fragment_like(frag_C, elem_dtype)
+            for i in range_constexpr(fx.size(frag_C.shape).unpack()):
+                frag_C_out[i] = frag_C[i].to(elem_dtype)
+            for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
+                row = m_part * half_block_m + fx.get_scalar(thr_mma_cRow[i])
+                col = n_part * half_block_n + fx.get_scalar(thr_mma_cCol[i])
+                sC[row, col] = frag_C_out[i]
+
+        fx.gpu.barrier()
+        store_fragment(0, 0, c00)
+        store_fragment(0, 1, c01)
+        store_fragment(1, 0, c10)
+        store_fragment(1, 1, c11)
+        fx.gpu.barrier()
+
+        gC = full_gC(bid_m, bid_n, row_base)
+        thr_sC = full_thr_copy_cshuffle.partition_S(sC)
+        thr_gC = full_thr_copy_cshuffle.partition_D(gC)
+        frag_C_cshuffle = fx.make_fragment_like(thr_sC)
+        pred_C = fx.make_fragment_like(full_thr_cRow, dtype=fx.Boolean)
+        for i in range_constexpr(fx.size(pred_C.shape).unpack()):
+            local_row = fx.get_scalar(full_thr_cRow[i])
+            local_col = fx.get_scalar(full_thr_cCol[i])
+            row_idx = bid_m * block_m + local_row
+            col_idx = bid_n * block_n + local_col
+            pred_C[i] = (
+                (local_row < block_m)
+                & (local_col < block_n)
+                & (row_idx < m)
+                & (col_idx < n)
+            )
         fx.copy(s2r_copy_atom, thr_sC, frag_C_cshuffle)
         fx.copy(r2g_copy_atom, frag_C_cshuffle, thr_gC, pred=pred_C)
         fx.gpu.barrier()
@@ -1421,10 +1508,13 @@ def gemm_hti_gfx950_grouped_kernel(
                 consume(c10, a1, b0)
                 consume(c11, a1, b1)
 
-            store_half_tile(0, 0, c00, bid_m, bid_n, m_g, row_base)
-            store_half_tile(0, 1, c01, bid_m, bid_n, m_g, row_base)
-            store_half_tile(1, 0, c10, bid_m, bid_n, m_g, row_base)
-            store_half_tile(1, 1, c11, bid_m, bid_n, m_g, row_base)
+            if const_expr(param.fuse_hti_epilogue):
+                store_full_tile(bid_m, bid_n, c00, c01, c10, c11, m_g, row_base)
+            else:
+                store_half_tile(0, 0, c00, bid_m, bid_n, m_g, row_base)
+                store_half_tile(0, 1, c01, bid_m, bid_n, m_g, row_base)
+                store_half_tile(1, 0, c10, bid_m, bid_n, m_g, row_base)
+                store_half_tile(1, 1, c11, bid_m, bid_n, m_g, row_base)
 
         remaining = (work_idx < tiles_after).select(tiles_after - work_idx, fx.Int32(0))
         work_idx = work_idx + (remaining + grid - 1) // grid * grid

@@ -56,6 +56,7 @@ def _make_grouped_gemm_param(gemm_config: dict[str, int | bool]):
         use_half_tile_interleaved=bool(
             gemm_config.get("USE_HALF_TILE_INTERLEAVED", False)
         ),
+        fuse_hti_epilogue=bool(gemm_config.get("FUSE_HTI_EPILOGUE", False)),
     )
 
 
@@ -180,6 +181,7 @@ class FlyDSLGroupedGemmConfig:
     GROUP_M: int = 0
     B_TO_LDS: bool = False
     USE_HALF_TILE_INTERLEAVED: bool = False
+    FUSE_HTI_EPILOGUE: bool = False
 
 
 def get_grouped_gemm_configs(m: int, n: int, k: int) -> list[dict[str, object]]:
@@ -235,6 +237,15 @@ def get_grouped_gemm_configs(m: int, n: int, k: int) -> list[dict[str, object]]:
             BLOCK_N_WARPS=2,
             B_TO_LDS=True,
             USE_HALF_TILE_INTERLEAVED=True,
+        ),
+        FlyDSLGroupedGemmConfig(
+            TILE_M=64,
+            TILE_N=128,
+            BLOCK_M_WARPS=2,
+            BLOCK_N_WARPS=2,
+            B_TO_LDS=True,
+            USE_HALF_TILE_INTERLEAVED=True,
+            FUSE_HTI_EPILOGUE=True,
         ),
         FlyDSLGroupedGemmConfig(
             TILE_M=128,
