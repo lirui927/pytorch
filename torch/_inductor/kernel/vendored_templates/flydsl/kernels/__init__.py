@@ -4,9 +4,10 @@ from .gemm_gfx950 import (
     infer_has_k_tail,
     launch_gemm_gfx950,
     launch_gemm_gfx950_grouped,
-    make_gemm_param_and_validate,
     make_gemm_gfx950_param,
+    make_gemm_param_and_validate,
 )
+
 
 __all__ = [
     "GEMM_DTYPE_BF16",
