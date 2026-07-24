@@ -214,6 +214,10 @@ def get_grouped_gemm_configs(m: int, n: int, k: int) -> list[dict[str, object]]:
         FlyDSLGroupedGemmConfig(TILE_M=128, TILE_N=128, STAGES=3, B_TO_LDS=True),
         FlyDSLGroupedGemmConfig(TILE_M=128, TILE_N=256, B_TO_LDS=True),
         FlyDSLGroupedGemmConfig(TILE_M=128, TILE_N=256, STAGES=3, B_TO_LDS=True),
+        # Swizzled group-M variants preserve the M-fast fallback for small
+        # groups and remap sufficiently large per-group tile grids.
+        FlyDSLGroupedGemmConfig(TILE_M=128, TILE_N=128, GROUP_M=4),
+        FlyDSLGroupedGemmConfig(TILE_M=128, TILE_N=128, B_TO_LDS=True, GROUP_M=4),
         # 2x2 half-tile-interleaved variant (stages=2 only): four half-block
         # accumulators + per-quadrant cshuffle store for better register tiling
         # and MMA scheduling. Requires m_waves=2, n_waves>=2 and even tiles.
@@ -225,6 +229,14 @@ def get_grouped_gemm_configs(m: int, n: int, k: int) -> list[dict[str, object]]:
             USE_HALF_TILE_INTERLEAVED=True,
         ),
         FlyDSLGroupedGemmConfig(
+            TILE_M=64,
+            TILE_N=128,
+            BLOCK_M_WARPS=2,
+            BLOCK_N_WARPS=2,
+            B_TO_LDS=True,
+            USE_HALF_TILE_INTERLEAVED=True,
+        ),
+        FlyDSLGroupedGemmConfig(
             TILE_M=128,
             TILE_N=128,
             BLOCK_M_WARPS=2,
@@ -233,6 +245,38 @@ def get_grouped_gemm_configs(m: int, n: int, k: int) -> list[dict[str, object]]:
         ),
         FlyDSLGroupedGemmConfig(
             TILE_M=128,
+            TILE_N=128,
+            BLOCK_M_WARPS=2,
+            BLOCK_N_WARPS=2,
+            B_TO_LDS=True,
+            USE_HALF_TILE_INTERLEAVED=True,
+        ),
+        FlyDSLGroupedGemmConfig(
+            TILE_M=128,
+            TILE_N=128,
+            BLOCK_M_WARPS=2,
+            BLOCK_N_WARPS=2,
+            GROUP_M=4,
+            B_TO_LDS=True,
+            USE_HALF_TILE_INTERLEAVED=True,
+        ),
+        FlyDSLGroupedGemmConfig(
+            TILE_M=128,
+            TILE_N=256,
+            BLOCK_M_WARPS=2,
+            BLOCK_N_WARPS=4,
+            USE_HALF_TILE_INTERLEAVED=True,
+        ),
+        FlyDSLGroupedGemmConfig(
+            TILE_M=128,
+            TILE_N=256,
+            BLOCK_M_WARPS=2,
+            BLOCK_N_WARPS=4,
+            B_TO_LDS=True,
+            USE_HALF_TILE_INTERLEAVED=True,
+        ),
+        FlyDSLGroupedGemmConfig(
+            TILE_M=256,
             TILE_N=256,
             BLOCK_M_WARPS=2,
             BLOCK_N_WARPS=4,
@@ -243,6 +287,7 @@ def get_grouped_gemm_configs(m: int, n: int, k: int) -> list[dict[str, object]]:
             TILE_N=256,
             BLOCK_M_WARPS=2,
             BLOCK_N_WARPS=4,
+            B_TO_LDS=True,
             USE_HALF_TILE_INTERLEAVED=True,
         ),
     ]

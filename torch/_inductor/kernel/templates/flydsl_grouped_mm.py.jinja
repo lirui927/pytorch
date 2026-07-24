@@ -45,7 +45,7 @@ def _flydsl_grouped_mm(output, mat1, mat2, offs, stream):
                 "stages": STAGES,
                 "m_waves": BLOCK_M_WARPS,
                 "n_waves": BLOCK_N_WARPS,
-                "group_m": 0,
+                "group_m": GROUP_M,
                 "b_to_lds": B_TO_LDS,
                 "use_half_tile_interleaved": USE_HALF_TILE_INTERLEAVED,
                 "has_bias": False,
