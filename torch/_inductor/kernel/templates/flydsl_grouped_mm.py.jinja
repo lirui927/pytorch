@@ -1,7 +1,7 @@
 from torch._inductor.kernel.vendored_templates.flydsl.kernels import (
-    infer_has_k_tail,
+    infer_grouped_has_k_tail,
     launch_gemm_gfx950_grouped,
-    make_gemm_param_and_validate,
+    make_grouped_gemm_param_and_validate,
 )
 from torch._inductor.runtime.flydsl_cache import (
     ensure_flydsl_cache_dir,
@@ -32,8 +32,8 @@ def _flydsl_grouped_mm(output, mat1, mat2, offs, stream):
 
     param = _grouped_param
     if param is None:
-        has_k_tail = infer_has_k_tail(GEMM_K, TILE_K, STAGES)
-        param = make_gemm_param_and_validate(
+        has_k_tail = infer_grouped_has_k_tail(GEMM_K, TILE_K, STAGES)
+        param = make_grouped_gemm_param_and_validate(
             GEMM_M,
             GEMM_N,
             GEMM_K,

@@ -33,6 +33,25 @@ def _make_gemm_param(gemm_config: dict[str, int | bool]):
         m_waves=int(gemm_config["BLOCK_M_WARPS"]),
         n_waves=int(gemm_config["BLOCK_N_WARPS"]),
         group_m=int(gemm_config["GROUP_M"]),
+        use_half_tile_interleaved=bool(
+            gemm_config.get("USE_HALF_TILE_INTERLEAVED", False)
+        ),
+    )
+
+
+def _make_grouped_gemm_param(gemm_config: dict[str, int | bool]):
+    from torch._inductor.kernel.vendored_templates.flydsl.kernels import (
+        make_grouped_gemm_gfx950_param,
+    )
+
+    return make_grouped_gemm_gfx950_param(
+        block_m=int(gemm_config["TILE_M"]),
+        block_n=int(gemm_config["TILE_N"]),
+        block_k=int(gemm_config["TILE_K"]),
+        stages=int(gemm_config["STAGES"]),
+        m_waves=int(gemm_config["BLOCK_M_WARPS"]),
+        n_waves=int(gemm_config["BLOCK_N_WARPS"]),
+        group_m=int(gemm_config["GROUP_M"]),
         b_to_lds=bool(gemm_config.get("B_TO_LDS", True)),
         use_half_tile_interleaved=bool(
             gemm_config.get("USE_HALF_TILE_INTERLEAVED", False)
@@ -167,8 +186,8 @@ def get_grouped_gemm_configs(m: int, n: int, k: int) -> list[dict[str, object]]:
     """Return grouped GEMM configs for the persistent multi-stage kernel.
 
     Grouped kernels either gather B directly into MFMA registers or stage
-    N-contiguous B vectors into LDS. Configs are validated against the shared
-    gemm_gfx950 param so autotuning never offers an unbuildable tile.
+    N-contiguous B vectors into LDS. Configs are validated by the grouped
+    parameter builder so autotuning never offers an unbuildable tile.
     """
     candidates = [
         # Small-M grouped/decode configs.  These reduce wasted work when each
@@ -237,7 +256,7 @@ def get_grouped_gemm_configs(m: int, n: int, k: int) -> list[dict[str, object]]:
             continue
         gemm_config = asdict(grouped_config)
         try:
-            _make_gemm_param(gemm_config)
+            _make_grouped_gemm_param(gemm_config)
         except Exception:
             continue
         configs.append(gemm_config)
