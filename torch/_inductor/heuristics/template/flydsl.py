@@ -39,6 +39,25 @@ def _make_gemm_param(gemm_config: dict[str, int | bool]):
     )
 
 
+def _make_grouped_gemm_param(gemm_config: dict[str, int | bool]):
+    from torch._inductor.kernel.vendored_templates.flydsl.kernels import (
+        make_grouped_gemm_gfx950_param,
+    )
+
+    return make_grouped_gemm_gfx950_param(
+        block_m=int(gemm_config["TILE_M"]),
+        block_n=int(gemm_config["TILE_N"]),
+        block_k=int(gemm_config["TILE_K"]),
+        stages=int(gemm_config["STAGES"]),
+        m_waves=int(gemm_config["BLOCK_M_WARPS"]),
+        n_waves=int(gemm_config["BLOCK_N_WARPS"]),
+        group_m=int(gemm_config["GROUP_M"]),
+        use_half_tile_interleaved=bool(
+            gemm_config.get("USE_HALF_TILE_INTERLEAVED", False)
+        ),
+    )
+
+
 def get_exhaustive_gemm_configs() -> list[FlyDSLGemmConfig]:
     """
     Returns the exhaustive configuration set for the gfx950 FlyDSL HGEMM kernel.
@@ -62,12 +81,8 @@ def get_exhaustive_gemm_configs() -> list[FlyDSLGemmConfig]:
     valid_configs: list[FlyDSLGemmConfig] = []
     for gemm_config in configs:
         if not gemm_config["USE_HALF_TILE_INTERLEAVED"]:
-            mma_m_iters = (
-                gemm_config["TILE_M"] // gemm_config["BLOCK_M_WARPS"] // 16
-            )
-            mma_n_iters = (
-                gemm_config["TILE_N"] // gemm_config["BLOCK_N_WARPS"] // 16
-            )
+            mma_m_iters = gemm_config["TILE_M"] // gemm_config["BLOCK_M_WARPS"] // 16
+            mma_n_iters = gemm_config["TILE_N"] // gemm_config["BLOCK_N_WARPS"] // 16
             if mma_m_iters > 4 or mma_n_iters > 4:
                 continue
         try:
@@ -149,3 +164,110 @@ def get_gemm_configs() -> list[dict[str, object]]:
     else:
         configs = [get_default_gemm_configs()[0]]
     return [asdict(gemm_config) for gemm_config in configs]
+
+
+@dataclass(frozen=True)
+class FlyDSLGroupedGemmConfig:
+    TILE_M: int
+    TILE_N: int = 128
+    TILE_K: int = 64
+    STAGES: int = 2
+    SPLIT_K: int = 1
+    BLOCK_M_WARPS: int = 1
+    BLOCK_N_WARPS: int = 4
+    BLOCK_K_WARPS: int = 1
+    GROUP_M: int = 0
+    USE_HALF_TILE_INTERLEAVED: bool = False
+
+
+def get_grouped_gemm_configs(m: int, n: int, k: int) -> list[dict[str, object]]:
+    """Return grouped GEMM configs for the persistent multi-stage kernel.
+
+    The grouped kernel always stages N-contiguous B vectors into LDS and reads
+    them back transposed. Configs are validated by the grouped parameter builder
+    so autotuning never offers an unbuildable tile.
+    """
+    candidates = [
+        # Small-M grouped/decode configs.  These reduce wasted work when each
+        # group has far fewer than 32 rows.
+        FlyDSLGroupedGemmConfig(TILE_M=16, TILE_N=64, BLOCK_M_WARPS=1, BLOCK_N_WARPS=2),
+        FlyDSLGroupedGemmConfig(
+            TILE_M=16, TILE_N=128, BLOCK_M_WARPS=1, BLOCK_N_WARPS=2
+        ),
+        FlyDSLGroupedGemmConfig(TILE_M=32, TILE_N=64, BLOCK_M_WARPS=1, BLOCK_N_WARPS=2),
+        FlyDSLGroupedGemmConfig(
+            TILE_M=32, TILE_N=256, BLOCK_M_WARPS=1, BLOCK_N_WARPS=4
+        ),
+        FlyDSLGroupedGemmConfig(TILE_M=32, TILE_N=128),
+        FlyDSLGroupedGemmConfig(TILE_M=64, TILE_N=128),
+        FlyDSLGroupedGemmConfig(TILE_M=64, TILE_N=256),
+        FlyDSLGroupedGemmConfig(TILE_M=128, TILE_N=128),
+        FlyDSLGroupedGemmConfig(TILE_M=128, TILE_N=256),
+        # Deeper pipelines, autotuned for the multi-stage overlap.
+        FlyDSLGroupedGemmConfig(TILE_M=64, TILE_N=128, STAGES=3),
+        FlyDSLGroupedGemmConfig(TILE_M=128, TILE_N=128, STAGES=3),
+        FlyDSLGroupedGemmConfig(TILE_M=128, TILE_N=256, STAGES=3),
+        # Swizzled group-M variant remaps sufficiently large per-group tile grids.
+        FlyDSLGroupedGemmConfig(TILE_M=128, TILE_N=128, GROUP_M=4),
+        # 2x2 half-tile-interleaved variant (stages=2 only): four half-block
+        # accumulators + per-quadrant cshuffle store for better register tiling
+        # and MMA scheduling. Requires m_waves=2, n_waves>=2 and even tiles.
+        FlyDSLGroupedGemmConfig(
+            TILE_M=64,
+            TILE_N=128,
+            BLOCK_M_WARPS=2,
+            BLOCK_N_WARPS=2,
+            USE_HALF_TILE_INTERLEAVED=True,
+        ),
+        FlyDSLGroupedGemmConfig(
+            TILE_M=128,
+            TILE_N=128,
+            BLOCK_M_WARPS=2,
+            BLOCK_N_WARPS=2,
+            USE_HALF_TILE_INTERLEAVED=True,
+        ),
+        FlyDSLGroupedGemmConfig(
+            TILE_M=128,
+            TILE_N=128,
+            BLOCK_M_WARPS=2,
+            BLOCK_N_WARPS=2,
+            GROUP_M=4,
+            USE_HALF_TILE_INTERLEAVED=True,
+        ),
+        FlyDSLGroupedGemmConfig(
+            TILE_M=128,
+            TILE_N=256,
+            BLOCK_M_WARPS=2,
+            BLOCK_N_WARPS=4,
+            USE_HALF_TILE_INTERLEAVED=True,
+        ),
+        FlyDSLGroupedGemmConfig(
+            TILE_M=256,
+            TILE_N=128,
+            BLOCK_M_WARPS=2,
+            BLOCK_N_WARPS=2,
+            USE_HALF_TILE_INTERLEAVED=True,
+        ),
+        FlyDSLGroupedGemmConfig(
+            TILE_M=256,
+            TILE_N=256,
+            BLOCK_M_WARPS=2,
+            BLOCK_N_WARPS=4,
+            USE_HALF_TILE_INTERLEAVED=True,
+        ),
+    ]
+    configs: list[dict[str, object]] = []
+    for grouped_config in candidates:
+        if grouped_config.TILE_M > max(128, m):
+            continue
+        if n < grouped_config.TILE_N or n % grouped_config.TILE_N != 0:
+            continue
+        if (k // grouped_config.TILE_K) < grouped_config.STAGES:
+            continue
+        gemm_config = asdict(grouped_config)
+        try:
+            _make_grouped_gemm_param(gemm_config)
+        except Exception:
+            continue
+        configs.append(gemm_config)
+    return configs
