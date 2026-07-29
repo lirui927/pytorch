@@ -90,10 +90,8 @@ class GroupedGemmGfx950Param:
     n_waves: fx.Constexpr[int]
     group_m: fx.Constexpr[int]
     use_half_tile_interleaved: fx.Constexpr[bool]
-    fuse_hti_epilogue: fx.Constexpr[bool]
     has_bias: fx.Constexpr[bool]
     has_k_tail: fx.Constexpr[bool]
-    has_odd_k_tiles: fx.Constexpr[bool]
     async_load_bytes: fx.Constexpr[int]
     in_data_bytes: fx.Constexpr[int]
     out_data_bytes: fx.Constexpr[int]
@@ -128,10 +126,8 @@ def make_grouped_gemm_gfx950_param(
     n_waves: int = 4,
     group_m: int = 0,
     use_half_tile_interleaved: bool = False,
-    fuse_hti_epilogue: bool = False,
     has_bias: bool = False,
     has_k_tail: bool = False,
-    has_odd_k_tiles: bool = False,
     mma_m: int = 16,
     mma_n: int = 16,
     mma_k: int = 32,
@@ -148,8 +144,6 @@ def make_grouped_gemm_gfx950_param(
         raise ValueError("m_waves and n_waves must be positive")
     if group_m < 0:
         raise ValueError("group_m must be non-negative")
-    if fuse_hti_epilogue and not use_half_tile_interleaved:
-        raise ValueError("fused HTI epilogue requires half-tile interleaving")
 
     in_dbytes = out_dbytes = 2
     cshuffle_vec_size = GFX950_DMA_BYTES // out_dbytes
@@ -259,10 +253,8 @@ def make_grouped_gemm_gfx950_param(
         n_waves=n_waves,
         group_m=group_m,
         use_half_tile_interleaved=use_half_tile_interleaved,
-        fuse_hti_epilogue=fuse_hti_epilogue,
         has_bias=has_bias,
         has_k_tail=has_k_tail,
-        has_odd_k_tiles=has_odd_k_tiles,
         async_load_bytes=GFX950_DMA_BYTES,
         in_data_bytes=in_dbytes,
         out_data_bytes=out_dbytes,
@@ -336,11 +328,86 @@ def make_grouped_gemm_gfx950_kernel_name(param: GroupedGemmGfx950Param) -> str:
     )
     name += f"_w{param.m_waves}x{param.n_waves}"
     name += f"_gm{param.group_m}"
-    name += f"_fep{int(param.fuse_hti_epilogue)}"
     name += f"_ktail{int(param.has_k_tail)}"
-    name += f"_oddkt{int(param.has_odd_k_tiles)}"
     name += "_hti" if param.use_half_tile_interleaved else "_ft"
     return name
+
+
+class _GroupedGemmGfx950Resources:
+    def __init__(
+        self,
+        a_buf,
+        b_buf,
+        out_buf,
+        offs_buf,
+        a_rsrc,
+        b_rsrc,
+        s2r_copy_atom,
+        r2g_copy_atom,
+        thr_mma,
+        thr_copy_A,
+        b_s2r_copy_atom,
+        thr_copy_B,
+    ):
+        self.a_buf = a_buf
+        self.b_buf = b_buf
+        self.out_buf = out_buf
+        self.offs_buf = offs_buf
+        self.a_rsrc = a_rsrc
+        self.b_rsrc = b_rsrc
+        self.s2r_copy_atom = s2r_copy_atom
+        self.r2g_copy_atom = r2g_copy_atom
+        self.thr_mma = thr_mma
+        self.thr_copy_A = thr_copy_A
+        self.b_s2r_copy_atom = b_s2r_copy_atom
+        self.thr_copy_B = thr_copy_B
+
+
+def _grouped_gemm_gfx950_resources(out, a, b, offs, tiled_mma, elem_dtype, tid):
+    a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
+    b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
+    out_buf = fx.rocdl.make_buffer_tensor(out, max_size=True)
+    offs_buf = fx.rocdl.make_buffer_tensor(offs, max_size=True)
+    a_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(a_buf))
+    b_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(b_buf))
+    s2r_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype)
+    g2r_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
+    r2g_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
+    thr_mma = tiled_mma.thr_slice(tid)
+    thr_copy_A = fx.make_tiled_copy_A(g2r_copy_atom, tiled_mma).get_slice(tid)
+    b_s2r_copy_atom = fx.make_copy_atom(rocdl.cdna4.LDSReadTrans16_64b(), elem_dtype)
+    thr_copy_B = fx.make_tiled_copy_B(b_s2r_copy_atom, tiled_mma).get_slice(tid)
+    return _GroupedGemmGfx950Resources(
+        a_buf,
+        b_buf,
+        out_buf,
+        offs_buf,
+        a_rsrc,
+        b_rsrc,
+        s2r_copy_atom,
+        r2g_copy_atom,
+        thr_mma,
+        thr_copy_A,
+        b_s2r_copy_atom,
+        thr_copy_B,
+    )
+
+
+def _grouped_gemm_gfx950_allocate_shared_storage(
+    block_m, block_n, block_k, stages, elem_dtype
+):
+    @fx.struct
+    class SharedABStorage:
+        a: fx.Array[elem_dtype, stages * block_m * block_k, 16]
+        b: fx.Array[elem_dtype, stages * block_n * block_k, 16]
+
+    @fx.union
+    class SharedStorage:
+        ab: SharedABStorage
+        c: fx.Array[elem_dtype, block_m * block_n, 16]
+
+    storage = fx.SharedAllocator().allocate(SharedStorage)
+    return storage.ab.a.peek().ptr, storage.ab.b.peek().ptr, storage.c.peek().ptr
 
 
 class _GroupedGemmGfx950Ctx:
@@ -357,6 +424,7 @@ class _GroupedGemmGfx950Ctx:
         a_buf,
         b_buf,
         out_buf,
+        offs_buf,
         s2r_copy_atom,
         r2g_copy_atom,
         thr_copy_A,
@@ -394,6 +462,7 @@ class _GroupedGemmGfx950Ctx:
         self.a_buf = a_buf
         self.b_buf = b_buf
         self.out_buf = out_buf
+        self.offs_buf = offs_buf
         self.s2r_copy_atom = s2r_copy_atom
         self.r2g_copy_atom = r2g_copy_atom
         self.thr_copy_A = thr_copy_A
@@ -421,7 +490,7 @@ class _GroupedGemmGfx950Ctx:
         self.wave_offset = wave_offset
 
 
-def _grouped_gemm_gfx950_setup(out, a, b, tiled_mma, param):
+def _grouped_gemm_gfx950_setup(out, a, b, offs, tiled_mma, param):
     block_m = param.block_m
     block_n = param.block_n
     block_k = param.block_k
@@ -430,32 +499,11 @@ def _grouped_gemm_gfx950_setup(out, a, b, tiled_mma, param):
     elem_dtype = _grouped_elem_dtype(param)
     tid = fx.thread_idx.x
 
-    @fx.struct
-    class SharedABStorage:
-        a: fx.Array[elem_dtype, stages * block_m * block_k, 16]
-        b: fx.Array[elem_dtype, stages * block_n * block_k, 16]
+    smem_a, smem_b, smem_c = _grouped_gemm_gfx950_allocate_shared_storage(
+        block_m, block_n, block_k, stages, elem_dtype
+    )
 
-    @fx.union
-    class SharedStorage:
-        ab: SharedABStorage
-        c: fx.Array[elem_dtype, block_m * block_n, 16]
-
-    storage = fx.SharedAllocator().allocate(SharedStorage)
-    smem_a = storage.ab.a.peek().ptr
-    smem_b = storage.ab.b.peek().ptr
-    smem_c = storage.c.peek().ptr
-
-    a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
-    b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
-    out_buf = fx.rocdl.make_buffer_tensor(out, max_size=True)
-    a_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(a_buf))
-    b_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(b_buf))
-
-    s2r_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype)
-    g2r_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
-    r2g_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
-    thr_mma = tiled_mma.thr_slice(tid)
-    thr_copy_A = fx.make_tiled_copy_A(g2r_copy_atom, tiled_mma).get_slice(tid)
+    rs = _grouped_gemm_gfx950_resources(out, a, b, offs, tiled_mma, elem_dtype, tid)
 
     swizzle = fx.static(fx.SwizzleType.get(3, 3, 3))
     a_lds_layout = fx.make_composed_layout(
@@ -474,22 +522,20 @@ def _grouped_gemm_gfx950_setup(out, a, b, tiled_mma, param):
 
     sA = fx.make_view(smem_a, a_lds_layout)
     sC = fx.make_view(smem_c, c_lds_layout)
-    frag_A = thr_mma.make_fragment_A(sA)
+    frag_A = rs.thr_mma.make_fragment_A(sA)
     bk_coords = fx.make_view(0, fx.make_layout((block_n, block_k), (0, 1)))
-    thr_mma_bK = thr_mma.partition_B(bk_coords)
+    thr_mma_bK = rs.thr_mma.partition_B(bk_coords)
     sB = fx.make_view(smem_b, b_lds_s2r_layout)
-    frag_B = thr_mma.make_fragment_B(sB)
-    b_s2r_copy_atom = fx.make_copy_atom(rocdl.cdna4.LDSReadTrans16_64b(), elem_dtype)
-    thr_copy_B = fx.make_tiled_copy_B(b_s2r_copy_atom, tiled_mma).get_slice(tid)
-    frag_B_retile = thr_copy_B.retile(frag_B)
+    frag_B = rs.thr_mma.make_fragment_B(sB)
+    frag_B_retile = rs.thr_copy_B.retile(frag_B)
 
-    frag_C = thr_mma.make_fragment_C(sC)
+    frag_C = rs.thr_mma.make_fragment_C(sC)
     frag_C_out = fx.make_fragment_like(frag_C, elem_dtype)
-    frag_A_retile = thr_copy_A.retile(frag_A)
+    frag_A_retile = rs.thr_copy_A.retile(frag_A)
     row_coords = fx.make_view(0, fx.make_layout((block_m, block_n), (1, 0)))
     col_coords = fx.make_view(0, fx.make_layout((block_m, block_n), (0, 1)))
-    thr_mma_cRow = thr_mma.partition_C(row_coords)
-    thr_mma_cCol = thr_mma.partition_C(col_coords)
+    thr_mma_cRow = rs.thr_mma.partition_C(row_coords)
+    thr_mma_cCol = rs.thr_mma.partition_C(col_coords)
 
     cshuffle_vec_size = GFX950_DMA_BYTES // param.out_data_bytes
     cshuffle_x_threads = block_n // cshuffle_vec_size
@@ -503,7 +549,7 @@ def _grouped_gemm_gfx950_setup(out, a, b, tiled_mma, param):
         cshuffle_val_layout,
     )
     tiled_copy_cshuffle = fx.make_tiled_copy(
-        r2g_copy_atom,
+        rs.r2g_copy_atom,
         cshuffle_tv_layout,
         cshuffle_tile,
     )
@@ -522,18 +568,19 @@ def _grouped_gemm_gfx950_setup(out, a, b, tiled_mma, param):
         param,
         tid,
         tiled_mma,
-        thr_mma,
+        rs.thr_mma,
         smem_a,
         smem_b,
-        a_rsrc,
-        b_rsrc,
-        a_buf,
-        b_buf,
-        out_buf,
-        s2r_copy_atom,
-        r2g_copy_atom,
-        thr_copy_A,
-        thr_copy_B,
+        rs.a_rsrc,
+        rs.b_rsrc,
+        rs.a_buf,
+        rs.b_buf,
+        rs.out_buf,
+        rs.offs_buf,
+        rs.s2r_copy_atom,
+        rs.r2g_copy_atom,
+        rs.thr_copy_A,
+        rs.thr_copy_B,
         a_lds_layout,
         b_lds_layout,
         b_lds_s2r_layout,
@@ -547,7 +594,7 @@ def _grouped_gemm_gfx950_setup(out, a, b, tiled_mma, param):
         thr_mma_cRow,
         thr_mma_cCol,
         thr_mma_bK,
-        b_s2r_copy_atom,
+        rs.b_s2r_copy_atom,
         thr_copy_cshuffle,
         thr_sC,
         thr_cRow,
@@ -725,7 +772,7 @@ def gemm_gfx950_grouped_kernel(
     tiled_mma: fx.TiledMma,
     param: GroupedGemmGfx950Param,
 ):
-    ctx = _grouped_gemm_gfx950_setup(out, a, b, tiled_mma, param)
+    ctx = _grouped_gemm_gfx950_setup(out, a, b, offs, tiled_mma, param)
     block_m = param.block_m
     block_n = param.block_n
     block_k = param.block_k
@@ -734,14 +781,12 @@ def gemm_gfx950_grouped_kernel(
     ldg_a_iters = param.ldg_a_iters
     num_pid_n = (n + block_n - 1) // block_n
     k_tiles = (k + block_k - 1) // block_k
-    offs_buf = fx.rocdl.make_buffer_tensor(offs, max_size=True)
-
     grid = fx.Int32(fx.grid_dim.x)
     work_idx = fx.Int32(fx.block_idx.x)
     tiles_before = fx.Int32(0)
     row_base = fx.Int32(0)
     for g in range(0, group_count, 1):
-        row_end = fx.get_scalar(offs_buf[g])
+        row_end = fx.get_scalar(ctx.offs_buf[g])
         m_g = row_end - row_base
         num_pid_m = (m_g + block_m - 1) // block_m
         tiles_after = tiles_before + num_pid_m * num_pid_n
@@ -818,34 +863,13 @@ def gemm_hti_gfx950_grouped_kernel(
     tid = fx.thread_idx.x
     num_pid_n = (n + block_n - 1) // block_n
     k_tiles = (k + block_k - 1) // block_k
+    has_odd_k_tiles = k_tiles % 2 != 0
 
-    @fx.struct
-    class SharedABStorage:
-        a: fx.Array[elem_dtype, 2 * block_m * block_k, 16]
-        b: fx.Array[elem_dtype, 2 * block_n * block_k, 16]
+    smem_a, smem_b, smem_c = _grouped_gemm_gfx950_allocate_shared_storage(
+        block_m, block_n, block_k, 2, elem_dtype
+    )
 
-    @fx.union
-    class SharedABStorageUnion:
-        ab: SharedABStorage
-        c: fx.Array[elem_dtype, block_m * block_n, 16]
-
-    storage = fx.SharedAllocator().allocate(SharedABStorageUnion)
-    smem_a = storage.ab.a.peek().ptr
-    smem_b = storage.ab.b.peek().ptr
-    smem_c = storage.c.peek().ptr
-
-    a_buf = fx.rocdl.make_buffer_tensor(a, max_size=True)
-    b_buf = fx.rocdl.make_buffer_tensor(b, max_size=True)
-    out_buf = fx.rocdl.make_buffer_tensor(out, max_size=True)
-    offs_buf = fx.rocdl.make_buffer_tensor(offs, max_size=True)
-    a_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(a_buf))
-    b_rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(b_buf))
-
-    s2r_copy_atom = fx.make_copy_atom(fx.UniversalCopy128b(), elem_dtype)
-    g2r_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
-    r2g_copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), elem_dtype)
-    thr_mma = tiled_mma.thr_slice(tid)
-    thr_copy_A = fx.make_tiled_copy_A(g2r_copy_atom, tiled_mma).get_slice(tid)
+    rs = _grouped_gemm_gfx950_resources(out, a, b, offs, tiled_mma, elem_dtype, tid)
 
     swizzle = fx.static(fx.SwizzleType.get(3, 3, 3))
     a_lds_layout = fx.make_composed_layout(
@@ -860,10 +884,7 @@ def gemm_hti_gfx950_grouped_kernel(
         swizzle,
         fx.make_layout((half_block_n, block_k), (1, half_block_n)),
     )
-    b_s2r_copy_atom = fx.make_copy_atom(rocdl.cdna4.LDSReadTrans16_64b(), elem_dtype)
-    thr_copy_B = fx.make_tiled_copy_B(b_s2r_copy_atom, tiled_mma).get_slice(tid)
     c_lds_layout = fx.make_layout((half_block_m, half_block_n), (half_block_n, 1))
-    full_c_lds_layout = fx.make_layout((block_m, block_n), (block_n, 1))
     wave_offset = rocdl.readfirstlane(
         fx.Int64.ir_type,
         fx.Int64(tid // GFX950_WAVE_SIZE * GFX950_WAVE_SIZE * async_load_bytes),
@@ -893,7 +914,7 @@ def gemm_hti_gfx950_grouped_kernel(
             global_k_idx = k_tile * block_k + swizzled_col_idx(m_local_idx, k_local_idx)
             safe_global_k_idx = (global_k_idx < k).select(global_k_idx, 0)
             global_offset = (safe_global_m_idx * k + safe_global_k_idx) * in_data_bytes
-            buffer_load_lds_inline(a_rsrc, lds_ptr, global_offset, async_load_bytes)
+            buffer_load_lds_inline(rs.a_rsrc, lds_ptr, global_offset, async_load_bytes)
             if i < half_ldg_a_iters - 1:
                 lds_ptr = lds_ptr + block_threads * async_load_bytes
 
@@ -914,18 +935,18 @@ def gemm_hti_gfx950_grouped_kernel(
             global_offset = (
                 group * k * n + safe_global_k_idx * n + global_n_idx
             ) * in_data_bytes
-            buffer_load_lds_inline(b_rsrc, lds_ptr, global_offset, async_load_bytes)
+            buffer_load_lds_inline(rs.b_rsrc, lds_ptr, global_offset, async_load_bytes)
             if i < half_ldg_b_iters - 1:
                 lds_ptr = lds_ptr + block_threads * async_load_bytes
 
     def load_a_fragment(m_part, read_stage):
         sA = fx.make_view(half_a_base(read_stage, m_part), a_lds_layout)
-        frag_A = thr_mma.make_fragment_A(sA)
-        frag_A_retile = thr_copy_A.retile(frag_A)
-        thr_sA_s2r = thr_copy_A.partition_S(sA)
+        frag_A = rs.thr_mma.make_fragment_A(sA)
+        frag_A_retile = rs.thr_copy_A.retile(frag_A)
+        thr_sA_s2r = rs.thr_copy_A.partition_S(sA)
         for block_k_iter in range_constexpr(block_k // param.mma_k):
             fx.copy(
-                s2r_copy_atom,
+                rs.s2r_copy_atom,
                 thr_sA_s2r[None, None, block_k_iter],
                 frag_A_retile[None, None, block_k_iter],
             )
@@ -936,12 +957,12 @@ def gemm_hti_gfx950_grouped_kernel(
             half_b_base(read_stage, n_part),
             b_half_lds_s2r_layout,
         )
-        frag_B = thr_mma.make_fragment_B(sB)
-        frag_B_retile = thr_copy_B.retile(frag_B)
-        thr_sB_s2r = thr_copy_B.partition_S(sB)
+        frag_B = rs.thr_mma.make_fragment_B(sB)
+        frag_B_retile = rs.thr_copy_B.retile(frag_B)
+        thr_sB_s2r = rs.thr_copy_B.partition_S(sB)
         for block_k_iter in range_constexpr(block_k // param.mma_k):
             fx.copy(
-                b_s2r_copy_atom,
+                rs.b_s2r_copy_atom,
                 thr_sB_s2r[None, None, block_k_iter],
                 frag_B_retile[None, None, block_k_iter],
             )
@@ -970,16 +991,8 @@ def gemm_hti_gfx950_grouped_kernel(
         row = row_base + bid_m * block_m + m_part * half_block_m
         col = bid_n * block_n + n_part * half_block_n
         return fx.make_view(
-            fx.add_offset(fx.get_iter(out_buf), row * n + col),
+            fx.add_offset(fx.get_iter(rs.out_buf), row * n + col),
             fx.make_layout((half_block_m, half_block_n), (n, 1)),
-        )
-
-    def full_gC(bid_m, bid_n, row_base):
-        row = row_base + bid_m * block_m
-        col = bid_n * block_n
-        return fx.make_view(
-            fx.add_offset(fx.get_iter(out_buf), row * n + col),
-            fx.make_layout((block_m, block_n), (n, 1)),
         )
 
     cshuffle_vec_size = GFX950_DMA_BYTES // param.out_data_bytes
@@ -994,43 +1007,19 @@ def gemm_hti_gfx950_grouped_kernel(
         cshuffle_val_layout,
     )
     tiled_copy_cshuffle = fx.make_tiled_copy(
-        r2g_copy_atom,
+        rs.r2g_copy_atom,
         cshuffle_tv_layout,
         cshuffle_tile,
     )
     thr_copy_cshuffle = tiled_copy_cshuffle.get_slice(tid)
     row_coords = fx.make_view(0, fx.make_layout((half_block_m, half_block_n), (1, 0)))
     col_coords = fx.make_view(0, fx.make_layout((half_block_m, half_block_n), (0, 1)))
-    thr_mma_cRow = thr_mma.partition_C(row_coords)
-    thr_mma_cCol = thr_mma.partition_C(col_coords)
+    thr_mma_cRow = rs.thr_mma.partition_C(row_coords)
+    thr_mma_cCol = rs.thr_mma.partition_C(col_coords)
     thr_cRow = thr_copy_cshuffle.partition_S(row_coords)[(0, None), None, None]
     thr_cCol = thr_copy_cshuffle.partition_S(col_coords)[(0, None), None, None]
-    full_cshuffle_x_threads = block_n // cshuffle_vec_size
-    full_cshuffle_thr_layout = fx.make_layout(
-        (block_threads // full_cshuffle_x_threads, full_cshuffle_x_threads),
-        (full_cshuffle_x_threads, 1),
-    )
-    full_cshuffle_val_layout = fx.make_layout((1, cshuffle_vec_size), (1, 1))
-    full_cshuffle_tile, full_cshuffle_tv_layout = fx.make_layout_tv(
-        full_cshuffle_thr_layout,
-        full_cshuffle_val_layout,
-    )
-    full_tiled_copy_cshuffle = fx.make_tiled_copy(
-        r2g_copy_atom,
-        full_cshuffle_tv_layout,
-        full_cshuffle_tile,
-    )
-    full_thr_copy_cshuffle = full_tiled_copy_cshuffle.get_slice(tid)
-    full_row_coords = fx.make_view(0, fx.make_layout((block_m, block_n), (1, 0)))
-    full_col_coords = fx.make_view(0, fx.make_layout((block_m, block_n), (0, 1)))
-    full_thr_cRow = full_thr_copy_cshuffle.partition_S(full_row_coords)[
-        (0, None), None, None
-    ]
-    full_thr_cCol = full_thr_copy_cshuffle.partition_S(full_col_coords)[
-        (0, None), None, None
-    ]
     bk_coords = fx.make_view(0, fx.make_layout((half_block_n, block_k), (0, 1)))
-    thr_mma_bK = thr_mma.partition_B(bk_coords)
+    thr_mma_bK = rs.thr_mma.partition_B(bk_coords)
 
     def store_half_tile(m_part, n_part, frag_C, bid_m, bid_n, m, row_base):
         gC = half_gC(m_part, n_part, bid_m, bid_n, row_base)
@@ -1063,57 +1052,18 @@ def gemm_hti_gfx950_grouped_kernel(
             sC[row, col] = frag_C_out[i]
 
         fx.gpu.barrier()
-        fx.copy(s2r_copy_atom, thr_sC, frag_C_cshuffle)
-        fx.copy(r2g_copy_atom, frag_C_cshuffle, thr_gC, pred=pred_C)
-        fx.gpu.barrier()
-
-    def store_full_tile(bid_m, bid_n, c00, c01, c10, c11, m, row_base):
-        sC = fx.make_view(smem_c, full_c_lds_layout)
-
-        def store_fragment(m_part, n_part, frag_C):
-            frag_C_out = fx.make_fragment_like(frag_C, elem_dtype)
-            for i in range_constexpr(fx.size(frag_C.shape).unpack()):
-                frag_C_out[i] = frag_C[i].to(elem_dtype)
-            for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
-                row = m_part * half_block_m + fx.get_scalar(thr_mma_cRow[i])
-                col = n_part * half_block_n + fx.get_scalar(thr_mma_cCol[i])
-                sC[row, col] = frag_C_out[i]
-
-        fx.gpu.barrier()
-        store_fragment(0, 0, c00)
-        store_fragment(0, 1, c01)
-        store_fragment(1, 0, c10)
-        store_fragment(1, 1, c11)
-        fx.gpu.barrier()
-
-        gC = full_gC(bid_m, bid_n, row_base)
-        thr_sC = full_thr_copy_cshuffle.partition_S(sC)
-        thr_gC = full_thr_copy_cshuffle.partition_D(gC)
-        frag_C_cshuffle = fx.make_fragment_like(thr_sC)
-        pred_C = fx.make_fragment_like(full_thr_cRow, dtype=fx.Boolean)
-        for i in range_constexpr(fx.size(pred_C.shape).unpack()):
-            local_row = fx.get_scalar(full_thr_cRow[i])
-            local_col = fx.get_scalar(full_thr_cCol[i])
-            row_idx = bid_m * block_m + local_row
-            col_idx = bid_n * block_n + local_col
-            pred_C[i] = (
-                (local_row < block_m)
-                & (local_col < block_n)
-                & (row_idx < m)
-                & (col_idx < n)
-            )
-        fx.copy(s2r_copy_atom, thr_sC, frag_C_cshuffle)
-        fx.copy(r2g_copy_atom, frag_C_cshuffle, thr_gC, pred=pred_C)
+        fx.copy(rs.s2r_copy_atom, thr_sC, frag_C_cshuffle)
+        fx.copy(rs.r2g_copy_atom, frag_C_cshuffle, thr_gC, pred=pred_C)
         fx.gpu.barrier()
 
     frag_shape = fx.make_view(
-        fx.get_iter(out_buf),
+        fx.get_iter(rs.out_buf),
         fx.make_layout((half_block_m, half_block_n), (n, 1)),
     )
-    c00 = thr_mma.make_fragment_C(frag_shape)
-    c01 = thr_mma.make_fragment_C(frag_shape)
-    c10 = thr_mma.make_fragment_C(frag_shape)
-    c11 = thr_mma.make_fragment_C(frag_shape)
+    c00 = rs.thr_mma.make_fragment_C(frag_shape)
+    c01 = rs.thr_mma.make_fragment_C(frag_shape)
+    c10 = rs.thr_mma.make_fragment_C(frag_shape)
+    c11 = rs.thr_mma.make_fragment_C(frag_shape)
 
     def compute_double_tile(
         k_tile,
@@ -1198,7 +1148,7 @@ def gemm_hti_gfx950_grouped_kernel(
     tiles_before = fx.Int32(0)
     row_base = fx.Int32(0)
     for g in range(0, group_count, 1):
-        row_end = fx.get_scalar(offs_buf[g])
+        row_end = fx.get_scalar(rs.offs_buf[g])
         m_g = row_end - row_base
         num_pid_m = (m_g + block_m - 1) // block_m
         tiles_after = tiles_before + num_pid_m * num_pid_n
@@ -1225,7 +1175,7 @@ def gemm_hti_gfx950_grouped_kernel(
             load_b_half(1, 1, 1, bid_n, g)
             __barrier(half_ldg_b_iters + half_ldg_a_iters)
 
-            if const_expr(param.has_odd_k_tiles):
+            if has_odd_k_tiles:
                 final_double_tile = k_tiles - 3
                 for k_tile in range(0, final_double_tile, 2):
                     compute_double_tile(k_tile, True, bid_m, bid_n, m_g, row_base, g)
@@ -1247,13 +1197,10 @@ def gemm_hti_gfx950_grouped_kernel(
                     main_loop_end, False, bid_m, bid_n, m_g, row_base, g
                 )
 
-            if const_expr(param.fuse_hti_epilogue):
-                store_full_tile(bid_m, bid_n, c00, c01, c10, c11, m_g, row_base)
-            else:
-                store_half_tile(0, 0, c00, bid_m, bid_n, m_g, row_base)
-                store_half_tile(0, 1, c01, bid_m, bid_n, m_g, row_base)
-                store_half_tile(1, 0, c10, bid_m, bid_n, m_g, row_base)
-                store_half_tile(1, 1, c11, bid_m, bid_n, m_g, row_base)
+            store_half_tile(0, 0, c00, bid_m, bid_n, m_g, row_base)
+            store_half_tile(0, 1, c01, bid_m, bid_n, m_g, row_base)
+            store_half_tile(1, 0, c10, bid_m, bid_n, m_g, row_base)
+            store_half_tile(1, 1, c11, bid_m, bid_n, m_g, row_base)
 
         remaining = (work_idx < tiles_after).select(tiles_after - work_idx, fx.Int32(0))
         work_idx = work_idx + (remaining + grid - 1) // grid * grid
@@ -1315,8 +1262,6 @@ def infer_grouped_has_k_tail(k: int, block_k: int, stages: int):
 
 def make_grouped_gemm_param_and_validate(m, n, k, kwargs):
     kwargs = dict(kwargs)
-    block_k = kwargs.get("block_k", 64)
-    kwargs["has_odd_k_tiles"] = ((k + block_k - 1) // block_k) % 2 != 0
     try:
         result = make_grouped_gemm_gfx950_param(**kwargs)
     except Exception:
