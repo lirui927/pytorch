@@ -516,11 +516,13 @@ def gemm_hti_gfx950_grouped_kernel(
     async_load_vec_size = async_load_bytes // in_data_bytes
     ldg_x_threads = param.ldg_x_threads
     block_threads = param.block_threads
+    n_waves = param.n_waves
     half_ldg_a_iters = param.ldg_a_iters // 2
     half_ldg_b_iters = param.ldg_b_iters // 2
     elem_dtype = _operand_fragment_dtype(param)
 
     tid = fx.thread_idx.x
+    wid = tid // GFX950_WAVE_SIZE
     k_tiles = (k - 1) // block_k + 1
 
     smem_a, smem_b, smem_c = _grouped_gemm_gfx950_allocate_shared_storage(
@@ -789,7 +791,10 @@ def gemm_hti_gfx950_grouped_kernel(
             __barrier(2 * half_ldg_b_iters + half_ldg_a_iters)
         consume(k_tile, c11, a1, b1)
         if const_expr(not prefetch_next):
-            __waitcnt(0)
+            # Retire the leading group's stage-1 A-half-0 copies before this
+            # barrier releases the first group. B/A half 1 may stay in flight.
+            # Both groups wait to avoid a wave-group branch in this hot path.
+            __waitcnt(half_ldg_b_iters + half_ldg_a_iters)
         rocdl.s_barrier()
 
         a0 = load_a_fragment(0, 1, k_tile + 1)
@@ -830,6 +835,9 @@ def gemm_hti_gfx950_grouped_kernel(
         load_b_half(1, 0, 0, bid_n, g)
         load_a_half(1, 0, 0, bid_m, m_g, row_base)
         rocdl.sched_barrier(0)
+        if wid // n_waves == 1:
+            # This barrier releases the first group to read stage 0.
+            __waitcnt(0)
         rocdl.s_barrier()
         rocdl.sched_barrier(0)
         load_b_half(0, 1, 1, bid_n, g)
